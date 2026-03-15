@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tubi 多轨字幕助手
 // @namespace    https://github.com/handsomedog/tubi-translate
-// @version      0.4.0
+// @version      0.4.1
 // @description  自动捕获 Tubi 字幕，并以多轨方式叠加显示原文、Google 翻译和模型翻译。
 // @match        https://tubitv.com/*
 // @match        https://*.tubitv.com/*
@@ -21,6 +21,7 @@
   const CACHE_KEY = "tb_translation_cache_v2";
   const TARGET_LANG = "zh-CN";
   const TRACK_ORDER = ["source", "google", "model1", "model2"];
+  const MODEL_TRACK_IDS = ["model1", "model2"];
   const TRANSLATION_TRACK_IDS = ["google", "model1", "model2"];
   const MAX_CACHE_ENTRIES = 5000;
   const TICK_MS = 120;
@@ -69,6 +70,7 @@
     panelToggleNode: null,
     statusNode: null,
     statusText: "等待检测字幕",
+    batchMetricNodes: createTrackNodeMap(),
     actionButtons: {},
     layoutSectionNode: null,
     layoutSectionBodyNode: null,
@@ -291,19 +293,21 @@
     const actions = document.createElement("div");
     actions.className = "tb-actions";
 
-    const retryButton = makeButton("重新载入字幕", "重新载入最近检测到的字幕文件", retryLastSubtitle);
+    const retryButton = makeButton("清空缓存并重载", "清空已缓存的译文，并重新请求当前字幕文件", clearCacheAndReloadSubtitle);
     const hideButton = makeButton("收起面板", "隐藏面板，只保留启动按钮", collapsePanel);
     actions.appendChild(retryButton);
     actions.appendChild(hideButton);
 
     const layoutSection = createLayoutPanel();
     const tracksSection = createTrackManagerPanel();
+    const batchMetricsSection = createBatchMetricsFooter();
 
     panelHeader.appendChild(status);
     panelHeader.appendChild(actions);
     panelScroll.appendChild(panelHeader);
     panelScroll.appendChild(layoutSection);
     panelScroll.appendChild(tracksSection);
+    panelScroll.appendChild(batchMetricsSection);
     panel.appendChild(panelScroll);
 
     trapPanelEvents(panel);
@@ -327,6 +331,7 @@
     applySubtitleStyles();
     refreshActionButtons();
     refreshAllTrackCardHeaders();
+    refreshBatchMetricsFooter();
     setPanelCollapsed(Boolean(state.settings.panelCollapsed), false);
   }
 
@@ -442,6 +447,31 @@
 
     TRACK_ORDER.forEach((trackId) => {
       section.appendChild(createTrackCard(trackId));
+    });
+
+    return section;
+  }
+
+  function createBatchMetricsFooter() {
+    const section = makePanelSection("批次统计");
+    section.classList.add("tb-batch-metrics");
+
+    MODEL_TRACK_IDS.forEach((trackId) => {
+      const row = document.createElement("div");
+      row.className = "tb-batch-metric-row";
+      row.style.setProperty("--tb-track-accent", TRACK_META[trackId].accent);
+
+      const label = document.createElement("span");
+      label.className = "tb-batch-metric-label";
+      label.textContent = TRACK_META[trackId].label;
+
+      const value = document.createElement("span");
+      value.className = "tb-batch-metric-value";
+
+      row.appendChild(label);
+      row.appendChild(value);
+      section.appendChild(row);
+      state.batchMetricNodes[trackId] = value;
     });
 
     return section;
@@ -864,10 +894,10 @@
       return;
     }
 
-    retryButton.textContent = "重新载入字幕";
+    retryButton.textContent = "清空缓存并重载";
     retryButton.title = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl
-      ? "重新请求当前字幕文件"
-      : "等待自动检测到字幕文件";
+      ? "清空已缓存的译文，并重新请求当前字幕文件"
+      : "清空已缓存的译文，等待自动检测到字幕文件";
 
     hideButton.textContent = "收起面板";
     hideButton.title = "隐藏面板，只保留启动按钮";
@@ -896,6 +926,43 @@
 
   function refreshAllTrackCardHeaders() {
     TRACK_ORDER.forEach((trackId) => refreshTrackCardHeader(trackId));
+  }
+
+  function refreshBatchMetricsFooter() {
+    MODEL_TRACK_IDS.forEach((trackId) => {
+      const node = state.batchMetricNodes[trackId];
+      if (!node) {
+        return;
+      }
+
+      const summary = formatBatchMetricsFooterSummary(trackId);
+      node.textContent = summary.text;
+      node.title = summary.title;
+    });
+  }
+
+  function formatBatchMetricsFooterSummary(trackId) {
+    const metrics = getTrackOpenAIBatchMetrics(trackId);
+    const attempts = metrics.attempts;
+
+    if (!attempts) {
+      if (metrics.singleRequests) {
+        return {
+          text: `当前仅单句 ${metrics.singleRequests} 次`,
+          title: `尚未触发多句批次翻译，单句请求 ${metrics.singleRequests} 次`
+        };
+      }
+
+      return {
+        text: "暂无数据",
+        title: "尚未发起批次翻译"
+      };
+    }
+
+    return {
+      text: `${formatPercent(metrics.successes, attempts)} (${metrics.successes}/${attempts})`,
+      title: `批次成功 ${metrics.successes}/${attempts}，回退 ${metrics.fallbacks} 次，单句 ${metrics.singleRequests} 次`
+    };
   }
 
   function refreshTrackCardHeader(trackId) {
@@ -1221,14 +1288,20 @@
     }
   }
 
-  function retryLastSubtitle() {
+  function clearCacheAndReloadSubtitle() {
     const url = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl;
+    clearTranslationCache();
+    resetAllTrackTranslationRuntimes();
+    state.cueKey = "";
+    renderActiveCue();
+    refreshAllTrackCardHeaders();
+
     if (!url) {
-      setStatus("尚未检测到字幕地址");
+      setStatus("已清空翻译缓存，等待检测字幕地址");
       return;
     }
 
-    loadSubtitleFromUrl(url, "重新载入");
+    loadSubtitleFromUrl(url, "清空缓存后重新载入");
   }
 
   function trapPanelEvents(node) {
@@ -1813,24 +1886,64 @@
       return [];
     }
 
+    const metrics = getTrackOpenAIBatchMetrics(trackId);
+
     if (texts.length === 1) {
+      metrics.singleRequests += 1;
+      metrics.singleItemsTranslated += 1;
+      refreshBatchMetricsFooter();
       return [await translateSingleTextWithOpenAI(trackId, texts[0])];
     }
 
+    metrics.attempts += 1;
+    metrics.itemsAttempted += texts.length;
+
     try {
-      return await translateBatchWithOpenAI(trackId, texts);
+      const translations = await translateBatchWithOpenAI(trackId, texts);
+      metrics.successes += 1;
+      metrics.itemsTranslatedInBatch += texts.length;
+      refreshBatchMetricsFooter();
+      logOpenAIBatchMetrics(trackId, metrics, "info", {
+        outcome: "batch_success",
+        batchSize: texts.length
+      });
+      return translations;
     } catch (error) {
       if (!shouldFallbackOpenAIBatch(error)) {
+        metrics.hardFailures += 1;
+        refreshBatchMetricsFooter();
+        logOpenAIBatchMetrics(trackId, metrics, "error", {
+          outcome: "batch_failed",
+          batchSize: texts.length,
+          error: error?.message || String(error)
+        });
         throw error;
       }
 
-      console.warn("[TB] OpenAI batch translation fell back to serial mode", {
-        trackId,
-        batchSize: texts.length,
-        error: error?.message || String(error)
-      });
-
-      return translateWithOpenAISerial(trackId, texts);
+      try {
+        const translations = await translateWithOpenAISerial(trackId, texts);
+        metrics.fallbacks += 1;
+        metrics.fallbackSuccesses += 1;
+        metrics.itemsTranslatedInFallback += texts.length;
+        refreshBatchMetricsFooter();
+        logOpenAIBatchMetrics(trackId, metrics, "warn", {
+          outcome: "batch_fallback_serial_success",
+          batchSize: texts.length,
+          error: error?.message || String(error)
+        });
+        return translations;
+      } catch (serialError) {
+        metrics.fallbacks += 1;
+        metrics.fallbackFailures += 1;
+        refreshBatchMetricsFooter();
+        logOpenAIBatchMetrics(trackId, metrics, "error", {
+          outcome: "batch_fallback_serial_failed",
+          batchSize: texts.length,
+          error: error?.message || String(error),
+          fallbackError: serialError?.message || String(serialError)
+        });
+        throw serialError;
+      }
     }
   }
 
@@ -1862,6 +1975,60 @@
   function shouldFallbackOpenAIBatch(error) {
     const message = error?.message || "";
     return message.startsWith("OpenAI batch response");
+  }
+
+  function getTrackOpenAIBatchMetrics(trackId) {
+    const runtime = state.trackRuntimes[trackId];
+    if (!runtime.batchMetrics) {
+      runtime.batchMetrics = createOpenAIBatchMetrics();
+    }
+    return runtime.batchMetrics;
+  }
+
+  function logOpenAIBatchMetrics(trackId, metrics, level, details) {
+    const logger = getConsoleLogger(level);
+    logger(`[TB] ${trackId} batch translation`, {
+      track: TRACK_META[trackId]?.label || trackId,
+      ...details,
+      stats: summarizeOpenAIBatchMetrics(metrics)
+    });
+  }
+
+  function summarizeOpenAIBatchMetrics(metrics) {
+    return {
+      attempts: metrics.attempts,
+      batchSuccesses: metrics.successes,
+      fallbacks: metrics.fallbacks,
+      hardFailures: metrics.hardFailures,
+      fallbackSuccesses: metrics.fallbackSuccesses,
+      fallbackFailures: metrics.fallbackFailures,
+      batchSuccessRate: formatPercent(metrics.successes, metrics.attempts),
+      fallbackRate: formatPercent(metrics.fallbacks, metrics.attempts),
+      itemsAttempted: metrics.itemsAttempted,
+      itemsTranslatedInBatch: metrics.itemsTranslatedInBatch,
+      itemsTranslatedInFallback: metrics.itemsTranslatedInFallback,
+      itemBatchCoverage: formatPercent(metrics.itemsTranslatedInBatch, metrics.itemsAttempted)
+    };
+  }
+
+  function formatPercent(part, total) {
+    if (!total) {
+      return "0.0%";
+    }
+
+    return `${((part / total) * 100).toFixed(1)}%`;
+  }
+
+  function getConsoleLogger(level) {
+    if (level === "error") {
+      return console.error;
+    }
+
+    if (level === "warn") {
+      return console.warn;
+    }
+
+    return console.info;
   }
 
   async function translateSingleTextWithOpenAI(trackId, text) {
@@ -2281,8 +2448,10 @@
     runtime.pendingKeys.clear();
     runtime.nextAttemptAt = 0;
     runtime.lastError = "";
+    runtime.batchMetrics = createOpenAIBatchMetrics();
     runtime.sessionToken += 1;
     refreshTrackCardHeader(trackId);
+    refreshBatchMetricsFooter();
   }
 
   function shouldTranslate(text) {
@@ -2608,6 +2777,11 @@
   function loadCache() {
     const value = GM_getValue(CACHE_KEY, {});
     return (value && typeof value === "object") ? value : {};
+  }
+
+  function clearTranslationCache() {
+    state.cache = {};
+    saveCache();
   }
 
   function saveCache() {
@@ -2951,10 +3125,27 @@
         nextAttemptAt: 0,
         sessionToken: 0,
         lastError: "",
-        testPending: false
+        testPending: false,
+        batchMetrics: createOpenAIBatchMetrics()
       };
       return result;
     }, {});
+  }
+
+  function createOpenAIBatchMetrics() {
+    return {
+      attempts: 0,
+      successes: 0,
+      fallbacks: 0,
+      hardFailures: 0,
+      fallbackSuccesses: 0,
+      fallbackFailures: 0,
+      singleRequests: 0,
+      singleItemsTranslated: 0,
+      itemsAttempted: 0,
+      itemsTranslatedInBatch: 0,
+      itemsTranslatedInFallback: 0
+    };
   }
 
   function createTrackTextMap(fillValue) {
@@ -3395,6 +3586,33 @@
       .tb-inline-actions {
         display: flex;
         justify-content: flex-end;
+      }
+
+      .tb-batch-metrics {
+        gap: 8px;
+      }
+
+      .tb-batch-metric-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 9px 10px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.04);
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tb-track-accent) 20%, transparent);
+      }
+
+      .tb-batch-metric-label {
+        color: var(--tb-track-accent);
+        font-weight: 700;
+      }
+
+      .tb-batch-metric-value {
+        color: rgba(243, 247, 251, 0.9);
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+        white-space: nowrap;
       }
 
       @media (max-width: 720px) {
