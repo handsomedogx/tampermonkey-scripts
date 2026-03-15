@@ -1,15 +1,14 @@
 // ==UserScript==
-// @name         Tubi Bilingual Subtitles
+// @name         Tubi 多轨字幕助手
 // @namespace    https://github.com/handsomedog/tubi-translate
-// @version      0.3.0
-// @description  Capture Tubi subtitle files, translate them, and render bilingual subtitles over the player.
+// @version      0.4.0
+// @description  自动捕获 Tubi 字幕，并以多轨方式叠加显示原文、Google 翻译和模型翻译。
 // @match        https://tubitv.com/*
 // @match        https://*.tubitv.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_registerMenuCommand
 // @connect      *
 // @noframes
 // ==/UserScript==
@@ -17,79 +16,46 @@
 (() => {
   "use strict";
 
-  const SETTINGS_KEY = "tb_settings_v1";
-  const CACHE_KEY = "tb_translation_cache_v1";
-  const MAX_CACHE_ENTRIES = 3000;
+  const LEGACY_SETTINGS_KEY = "tb_settings_v1";
+  const SETTINGS_KEY = "tb_settings_v2";
+  const CACHE_KEY = "tb_translation_cache_v2";
+  const TARGET_LANG = "zh-CN";
+  const TRACK_ORDER = ["source", "google", "model1", "model2"];
+  const TRANSLATION_TRACK_IDS = ["google", "model1", "model2"];
+  const MAX_CACHE_ENTRIES = 5000;
   const TICK_MS = 120;
+  const TRANSLATION_LOOKAHEAD_SECONDS = 75;
+  const TRANSLATION_LOOKAHEAD_CUES = 28;
+  const TRANSLATION_BACKTRACK_CUES = 2;
+  const TRANSLATION_MIN_BATCH_CUES = 4;
+  const TRANSLATION_URGENT_LEAD_SECONDS = 18;
+  const TRANSLATION_BATCH_COOLDOWN_MS = 900;
+  const TRANSLATION_FAILURE_BACKOFF_MS = 5000;
 
-  const DEFAULT_SETTINGS = {
-    sourceLang: "auto",
-    targetLang: "zh-CN",
-    engine: "google-free",
-    openaiApiUrl: "https://api.openai.com/v1/chat/completions",
-    openaiApiKey: "",
-    openaiModel: "",
-    openaiSystemPrompt: "You are a subtitle translator. Translate the subtitle text faithfully into the target language. Return only the translated subtitle text.",
-    openaiTemperature: 0,
-    openaiTimeoutMs: 30000,
-    openaiTestText: "Hello. This is a subtitle translation test.",
-    showOriginal: true,
-    showTranslation: true,
-    hideNativeTracks: true,
-    fontScale: 1,
-    bottomOffsetPx: 82,
-    maxWidthPercent: 88,
-    lineGapEm: 0.35,
-    textAlign: "center",
-    originalScale: 1,
-    originalColor: "#ffffff",
-    originalBgColor: "#000000",
-    originalBgOpacity: 0.58,
-    originalFontWeight: 700,
-    translationScale: 0.92,
-    translationColor: "#ffe082",
-    translationBgColor: "#000000",
-    translationBgOpacity: 0.58,
-    translationFontWeight: 600,
-    lineBreakMode: "smart",
-    originalCaseMode: "smart",
-    stylePanelOpen: false,
-    enginePanelOpen: false,
-    panelCollapsed: true,
-    batchChars: 900,
-    manualSubtitleUrl: ""
+  const TRACK_META = {
+    source: {
+      label: "源字幕",
+      accent: "#ffffff",
+      kind: "source"
+    },
+    google: {
+      label: "Google 翻译",
+      accent: "#ffe082",
+      kind: "google-free"
+    },
+    model1: {
+      label: "模型 1",
+      accent: "#8bd6ff",
+      kind: "openai-compatible"
+    },
+    model2: {
+      label: "模型 2",
+      accent: "#ff9ec4",
+      kind: "openai-compatible"
+    }
   };
 
-  const STYLE_SETTING_KEYS = [
-    "fontScale",
-    "bottomOffsetPx",
-    "maxWidthPercent",
-    "lineGapEm",
-    "textAlign",
-    "originalScale",
-    "originalColor",
-    "originalBgColor",
-    "originalBgOpacity",
-    "originalFontWeight",
-    "translationScale",
-    "translationColor",
-    "translationBgColor",
-    "translationBgOpacity",
-    "translationFontWeight",
-    "lineBreakMode",
-    "originalCaseMode"
-  ];
-
-  const ENGINE_SETTING_KEYS = [
-    "engine",
-    "openaiApiUrl",
-    "openaiApiKey",
-    "openaiModel",
-    "openaiSystemPrompt",
-    "openaiTemperature",
-    "openaiTimeoutMs",
-    "openaiTestText"
-  ];
+  let migratedLegacySettings = false;
 
   const state = {
     settings: loadSettings(),
@@ -98,19 +64,26 @@
     host: null,
     overlayRoot: null,
     subtitleBox: null,
-    originalNode: null,
-    translationNode: null,
+    trackNodes: createTrackNodeMap(),
     panelNode: null,
     panelToggleNode: null,
-    styleControlsNode: null,
-    engineControlsNode: null,
-    engineTestButtonNode: null,
-    actionButtons: {},
     statusNode: null,
-    statusText: "Waiting for subtitles",
-    styleControlBindings: [],
-    engineControlBindings: [],
-    engineTestPending: false,
+    statusText: "等待检测字幕",
+    actionButtons: {},
+    layoutSectionNode: null,
+    layoutSectionBodyNode: null,
+    layoutSectionToggleButton: null,
+    layoutControlBindings: [],
+    trackControlBindings: createTrackBindingMap(),
+    trackCardNodes: {},
+    trackCardBodyNodes: {},
+    trackCardStatusNodes: {},
+    trackToggleButtons: {},
+    trackExpandButtons: {},
+    trackTestButtons: {},
+    openCards: new Set(),
+    trackRuntimes: createTrackRuntimeMap(),
+    renderedTrackTexts: createTrackTextMap(""),
     tickId: 0,
     bindQueued: false,
     cueKey: "",
@@ -127,9 +100,13 @@
   function init() {
     patchFetch();
     patchXHR();
+    bindKeyboardEventGuard();
     injectStyles();
-    registerMenuCommands();
     observePage();
+
+    if (migratedLegacySettings) {
+      saveSettings();
+    }
 
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", onDomReady, { once: true });
@@ -143,10 +120,6 @@
 
     if (!state.tickId) {
       state.tickId = window.setInterval(onTick, TICK_MS);
-    }
-
-    if (state.settings.manualSubtitleUrl) {
-      loadSubtitleFromUrl(state.settings.manualSubtitleUrl, "manual");
     }
   }
 
@@ -198,6 +171,7 @@
     if (!candidates.length) {
       state.video = null;
       state.host = null;
+      refreshAllTrackCardHeaders();
       return;
     }
 
@@ -218,26 +192,8 @@
     state.cueKey = "";
     ensureOverlayAttached();
     syncOverlayLayout();
-
     syncNativeCaptionVisibility();
-  }
-
-  function onTick() {
-    if (!state.video || !state.video.isConnected) {
-      queueBindVideo();
-    }
-
-    if (!state.video) {
-      clearRenderedCue();
-      return;
-    }
-
-    ensureOverlayAttached();
-    syncOverlayLayout();
-
-    syncNativeCaptionVisibility();
-
-    renderActiveCue();
+    refreshAllTrackCardHeaders();
   }
 
   function ensureOverlayAttached() {
@@ -282,6 +238,25 @@
     return video.parentElement || null;
   }
 
+  function onTick() {
+    if (!state.video || !state.video.isConnected) {
+      queueBindVideo();
+    }
+
+    if (!state.video) {
+      clearRenderedCue();
+      refreshAllTrackCardHeaders();
+      return;
+    }
+
+    ensureOverlayAttached();
+    syncOverlayLayout();
+    syncNativeCaptionVisibility();
+    renderActiveCue();
+    pumpProgressiveTranslation();
+    refreshAllTrackCardHeaders();
+  }
+
   function createOverlay() {
     const root = document.createElement("div");
     root.className = "tb-root";
@@ -289,19 +264,25 @@
     const subtitleBox = document.createElement("div");
     subtitleBox.className = "tb-subtitle-box";
 
-    const originalNode = document.createElement("div");
-    originalNode.className = "tb-line tb-original";
-
-    const translationNode = document.createElement("div");
-    translationNode.className = "tb-line tb-translation";
-
-    subtitleBox.appendChild(originalNode);
-    subtitleBox.appendChild(translationNode);
+    TRACK_ORDER.forEach((trackId) => {
+      const node = document.createElement("div");
+      node.className = `tb-line tb-track-${trackId}`;
+      node.dataset.trackId = trackId;
+      node.style.setProperty("--tb-track-accent", TRACK_META[trackId].accent);
+      subtitleBox.appendChild(node);
+      state.trackNodes[trackId] = node;
+    });
 
     const launcher = makeLauncherButton();
 
     const panel = document.createElement("div");
     panel.className = "tb-panel";
+
+    const panelScroll = document.createElement("div");
+    panelScroll.className = "tb-panel-scroll";
+
+    const panelHeader = document.createElement("div");
+    panelHeader.className = "tb-panel-header";
 
     const status = document.createElement("div");
     status.className = "tb-status";
@@ -309,35 +290,21 @@
 
     const actions = document.createElement("div");
     actions.className = "tb-actions";
-    const manualUrlButton = makeButton("Subtitle URL", "Set a manual subtitle file URL", promptManualUrl);
-    const targetLangButton = makeButton("Target Language", "Set the translation target language", promptTargetLanguage);
-    const engineButton = makeButton("Engine Settings", "Open translation engine settings", toggleEnginePanel);
-    const retryButton = makeButton("Reload Subtitle", "Reload the last detected subtitle file", retryLastSubtitle);
-    const originalButton = makeButton("Original: On", "Toggle the original subtitle line", toggleOriginal);
-    const translationButton = makeButton("Translation: On", "Toggle the translated subtitle line", toggleTranslation);
-    const styleButton = makeButton("Style Panel", "Open subtitle style settings", toggleStylePanel);
-    const hideButton = makeButton("Hide Panel", "Hide the subtitle tools panel", collapsePanel);
-    const exportButton = makeButton("Export SRT", "Export the current bilingual subtitles as SRT", exportBilingualSrt);
 
-    [
-      manualUrlButton,
-      targetLangButton,
-      engineButton,
-      retryButton,
-      originalButton,
-      translationButton,
-      styleButton,
-      hideButton,
-      exportButton
-    ].forEach((button) => actions.appendChild(button));
+    const retryButton = makeButton("重新载入字幕", "重新载入最近检测到的字幕文件", retryLastSubtitle);
+    const hideButton = makeButton("收起面板", "隐藏面板，只保留启动按钮", collapsePanel);
+    actions.appendChild(retryButton);
+    actions.appendChild(hideButton);
 
-    const styleControls = createStylePanel();
-    const engineControls = createEnginePanel();
+    const layoutSection = createLayoutPanel();
+    const tracksSection = createTrackManagerPanel();
 
-    panel.appendChild(status);
-    panel.appendChild(actions);
-    panel.appendChild(styleControls);
-    panel.appendChild(engineControls);
+    panelHeader.appendChild(status);
+    panelHeader.appendChild(actions);
+    panelScroll.appendChild(panelHeader);
+    panelScroll.appendChild(layoutSection);
+    panelScroll.appendChild(tracksSection);
+    panel.appendChild(panelScroll);
 
     trapPanelEvents(panel);
 
@@ -347,35 +314,348 @@
 
     state.overlayRoot = root;
     state.subtitleBox = subtitleBox;
-    state.originalNode = originalNode;
-    state.translationNode = translationNode;
     state.panelNode = panel;
     state.panelToggleNode = launcher;
-    state.styleControlsNode = styleControls;
-    state.engineControlsNode = engineControls;
-    state.actionButtons = {
-      manualUrlButton,
-      targetLangButton,
-      engineButton,
-      retryButton,
-      originalButton,
-      translationButton,
-      styleButton,
-      hideButton,
-      exportButton
-    };
     state.statusNode = status;
+    state.actionButtons = {
+      retryButton,
+      hideButton
+    };
 
+    syncLayoutControlBindings();
+    TRACK_ORDER.forEach((trackId) => syncTrackControlBindings(trackId));
     applySubtitleStyles();
     refreshActionButtons();
+    refreshAllTrackCardHeaders();
+    setPanelCollapsed(Boolean(state.settings.panelCollapsed), false);
+  }
 
-    if (state.settings.enginePanelOpen) {
-      setEnginePanelVisible(true, false);
+  function createLayoutPanel() {
+    state.layoutControlBindings = [];
+
+    const section = makePanelSection("全局布局");
+    section.classList.add("tb-panel-section-collapsible");
+
+    const header = document.createElement("div");
+    header.className = "tb-panel-section-header";
+    header.addEventListener("click", () => toggleLayoutSection());
+
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "tb-panel-section-title-wrap";
+
+    const title = document.createElement("div");
+    title.className = "tb-section-title";
+    title.textContent = "全局布局";
+
+    const meta = document.createElement("div");
+    meta.className = "tb-panel-section-meta";
+    meta.textContent = "控制所有字幕轨共享的布局和显示规则";
+
+    titleWrap.appendChild(title);
+    titleWrap.appendChild(meta);
+
+    const toggleButton = makeMiniButton("", "", () => toggleLayoutSection());
+    toggleButton.classList.add("tb-panel-section-toggle");
+
+    header.appendChild(titleWrap);
+    header.appendChild(toggleButton);
+
+    const body = document.createElement("div");
+    body.className = "tb-panel-section-body";
+
+    body.appendChild(makeRangeControl(state.layoutControlBindings, "基础字号", {
+      getValue: () => state.settings.layout.fontScale,
+      onInput: (value) => applyLayoutSetting("fontScale", value, true),
+      onChange: (value) => applyLayoutSetting("fontScale", value, false),
+      min: 0.7,
+      max: 1.8,
+      step: 0.05,
+      format: (value) => `${formatNumber(value, 2)}x`
+    }));
+    body.appendChild(makeRangeControl(state.layoutControlBindings, "底部偏移", {
+      getValue: () => state.settings.layout.bottomOffsetPx,
+      onInput: (value) => applyLayoutSetting("bottomOffsetPx", value, true),
+      onChange: (value) => applyLayoutSetting("bottomOffsetPx", value, false),
+      min: 0,
+      max: 180,
+      step: 1,
+      format: (value) => `${Math.round(value)}px`
+    }));
+    body.appendChild(makeRangeControl(state.layoutControlBindings, "最大宽度", {
+      getValue: () => state.settings.layout.maxWidthPercent,
+      onInput: (value) => applyLayoutSetting("maxWidthPercent", value, true),
+      onChange: (value) => applyLayoutSetting("maxWidthPercent", value, false),
+      min: 60,
+      max: 100,
+      step: 1,
+      format: (value) => `${Math.round(value)}%`
+    }));
+    body.appendChild(makeRangeControl(state.layoutControlBindings, "轨间距", {
+      getValue: () => state.settings.layout.lineGapEm,
+      onInput: (value) => applyLayoutSetting("lineGapEm", value, true),
+      onChange: (value) => applyLayoutSetting("lineGapEm", value, false),
+      min: 0,
+      max: 1.2,
+      step: 0.05,
+      format: (value) => `${formatNumber(value, 2)}em`
+    }));
+    body.appendChild(makeSelectControl(state.layoutControlBindings, "对齐方式", {
+      getValue: () => state.settings.layout.textAlign,
+      onChange: (value) => applyLayoutSetting("textAlign", value, false),
+      choices: [
+        ["left", "左对齐"],
+        ["center", "居中"],
+        ["right", "右对齐"]
+      ]
+    }));
+    body.appendChild(makeSelectControl(state.layoutControlBindings, "换行模式", {
+      getValue: () => state.settings.layout.lineBreakMode,
+      onChange: (value) => applyLayoutSetting("lineBreakMode", value, false),
+      choices: [
+        ["smart", "智能合并"],
+        ["raw", "保留原样"]
+      ]
+    }));
+    body.appendChild(makeSelectControl(state.layoutControlBindings, "原文大小写", {
+      getValue: () => state.settings.layout.originalCaseMode,
+      onChange: (value) => applyLayoutSetting("originalCaseMode", value, false),
+      choices: [
+        ["smart", "智能修正"],
+        ["raw", "保留原样"]
+      ]
+    }));
+
+    section.appendChild(header);
+    section.appendChild(body);
+
+    state.layoutSectionNode = section;
+    state.layoutSectionBodyNode = body;
+    state.layoutSectionToggleButton = toggleButton;
+    refreshLayoutSectionState();
+
+    return section;
+  }
+
+  function createTrackManagerPanel() {
+    const section = makePanelSection("字幕管理");
+    section.appendChild(makeHintText("固定顺序为：源字幕、Google 翻译、模型 1、模型 2。已启用译文轨会按播放进度逐步翻译。"));
+
+    TRACK_ORDER.forEach((trackId) => {
+      section.appendChild(createTrackCard(trackId));
+    });
+
+    return section;
+  }
+
+  function createTrackCard(trackId) {
+    state.trackControlBindings[trackId] = [];
+
+    const card = document.createElement("section");
+    card.className = "tb-track-card";
+    card.style.setProperty("--tb-track-accent", TRACK_META[trackId].accent);
+    card.dataset.trackId = trackId;
+
+    const header = document.createElement("div");
+    header.className = "tb-track-card-header";
+    header.addEventListener("click", () => toggleTrackCard(trackId));
+
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "tb-track-card-title-wrap";
+
+    const title = document.createElement("div");
+    title.className = "tb-track-card-title";
+    title.textContent = TRACK_META[trackId].label;
+
+    const meta = document.createElement("div");
+    meta.className = "tb-track-card-meta";
+    meta.textContent = getTrackMetaText(trackId);
+
+    titleWrap.appendChild(title);
+    titleWrap.appendChild(meta);
+
+    const headerActions = document.createElement("div");
+    headerActions.className = "tb-track-card-actions";
+
+    const status = document.createElement("span");
+    status.className = "tb-track-status";
+
+    const toggleButton = makeMiniButton("", "", () => toggleTrackEnabled(trackId));
+    const expandButton = makeMiniButton("", "", () => toggleTrackCard(trackId));
+
+    headerActions.appendChild(status);
+    headerActions.appendChild(toggleButton);
+    headerActions.appendChild(expandButton);
+
+    header.appendChild(titleWrap);
+    header.appendChild(headerActions);
+
+    const body = document.createElement("div");
+    body.className = "tb-track-card-body tb-hidden";
+
+    const styleSection = document.createElement("div");
+    styleSection.className = "tb-track-block";
+    styleSection.appendChild(makeBlockTitle("样式"));
+    styleSection.appendChild(makeRangeControl(state.trackControlBindings[trackId], "字号倍率", {
+      getValue: () => state.settings.tracks[trackId].style.scale,
+      onInput: (value) => applyTrackStyleSetting(trackId, "scale", value, true),
+      onChange: (value) => applyTrackStyleSetting(trackId, "scale", value, false),
+      min: 0.7,
+      max: 1.8,
+      step: 0.05,
+      format: (value) => `${formatNumber(value, 2)}x`
+    }));
+    styleSection.appendChild(makeRangeControl(state.trackControlBindings[trackId], "字重", {
+      getValue: () => state.settings.tracks[trackId].style.fontWeight,
+      onInput: (value) => applyTrackStyleSetting(trackId, "fontWeight", value, true),
+      onChange: (value) => applyTrackStyleSetting(trackId, "fontWeight", value, false),
+      min: 400,
+      max: 900,
+      step: 100,
+      format: (value) => String(Math.round(value))
+    }));
+    styleSection.appendChild(makeColorControl(state.trackControlBindings[trackId], "文字颜色", {
+      getValue: () => state.settings.tracks[trackId].style.color,
+      onInput: (value) => applyTrackStyleSetting(trackId, "color", value, true),
+      onChange: (value) => applyTrackStyleSetting(trackId, "color", value, false),
+      format: (value) => String(value).toUpperCase()
+    }));
+    styleSection.appendChild(makeColorControl(state.trackControlBindings[trackId], "底色", {
+      getValue: () => state.settings.tracks[trackId].style.bgColor,
+      onInput: (value) => applyTrackStyleSetting(trackId, "bgColor", value, true),
+      onChange: (value) => applyTrackStyleSetting(trackId, "bgColor", value, false),
+      format: (value) => String(value).toUpperCase()
+    }));
+    styleSection.appendChild(makeRangeControl(state.trackControlBindings[trackId], "底色透明", {
+      getValue: () => state.settings.tracks[trackId].style.bgOpacity,
+      onInput: (value) => applyTrackStyleSetting(trackId, "bgOpacity", value, true),
+      onChange: (value) => applyTrackStyleSetting(trackId, "bgOpacity", value, false),
+      min: 0,
+      max: 1,
+      step: 0.05,
+      format: (value) => formatNumber(value, 2)
+    }));
+
+    body.appendChild(styleSection);
+
+    if (isModelTrack(trackId)) {
+      const configSection = document.createElement("div");
+      configSection.className = "tb-track-block";
+      configSection.appendChild(makeBlockTitle("模型配置"));
+      configSection.appendChild(makeTextControl(state.trackControlBindings[trackId], "接口 URL", {
+        getValue: () => state.settings.tracks[trackId].apiUrl,
+        onInput: (value) => applyModelSetting(trackId, "apiUrl", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "apiUrl", value, false, true),
+        placeholder: "https://api.openai.com/v1/chat/completions"
+      }));
+      configSection.appendChild(makePasswordControl(state.trackControlBindings[trackId], "API Key", {
+        getValue: () => state.settings.tracks[trackId].apiKey,
+        onInput: (value) => applyModelSetting(trackId, "apiKey", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "apiKey", value, false, true),
+        placeholder: "sk-..."
+      }));
+      configSection.appendChild(makeTextControl(state.trackControlBindings[trackId], "模型名", {
+        getValue: () => state.settings.tracks[trackId].model,
+        onInput: (value) => applyModelSetting(trackId, "model", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "model", value, false, true),
+        placeholder: "gpt-4.1-mini"
+      }));
+      configSection.appendChild(makeNumberControl(state.trackControlBindings[trackId], "温度", {
+        getValue: () => state.settings.tracks[trackId].temperature,
+        onInput: (value) => applyModelSetting(trackId, "temperature", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "temperature", value, false, true),
+        min: 0,
+        max: 2,
+        step: 0.1,
+        format: (value) => formatNumber(value, 1)
+      }));
+      configSection.appendChild(makeNumberControl(state.trackControlBindings[trackId], "超时", {
+        getValue: () => state.settings.tracks[trackId].timeoutMs,
+        onInput: (value) => applyModelSetting(trackId, "timeoutMs", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "timeoutMs", value, false, true),
+        min: 5000,
+        max: 120000,
+        step: 1000,
+        format: (value) => `${Math.round(value)}ms`
+      }));
+      configSection.appendChild(makeTextareaControl(state.trackControlBindings[trackId], "系统提示词", {
+        getValue: () => state.settings.tracks[trackId].systemPrompt,
+        onInput: (value) => applyModelSetting(trackId, "systemPrompt", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "systemPrompt", value, false, true),
+        rows: 4,
+        placeholder: "You are a subtitle translator..."
+      }));
+      configSection.appendChild(makeTextareaControl(state.trackControlBindings[trackId], "测试文本", {
+        getValue: () => state.settings.tracks[trackId].testText,
+        onInput: (value) => applyModelSetting(trackId, "testText", value, true, false),
+        onChange: (value) => applyModelSetting(trackId, "testText", value, false, false),
+        rows: 3,
+        placeholder: "输入一段短句用于测试接口。"
+      }));
+      configSection.appendChild(makeHintText("测试接口只会发送一条短句，不会修改当前字幕状态。"));
+
+      const testActions = document.createElement("div");
+      testActions.className = "tb-inline-actions";
+      const testButton = makeMiniButton("测试接口", "发送测试文本验证模型接口", () => testModelTrack(trackId));
+      testButton.classList.add("tb-button-secondary");
+      testActions.appendChild(testButton);
+      configSection.appendChild(testActions);
+
+      state.trackTestButtons[trackId] = testButton;
+      body.appendChild(configSection);
+    } else if (trackId === "google") {
+      body.appendChild(makeHintText("使用内置 Google Translate 网页接口，目标语言固定为简体中文。"));
     } else {
-      setStylePanelVisible(Boolean(state.settings.stylePanelOpen), false);
+      body.appendChild(makeHintText("原文字轨直接显示捕获到的字幕内容，不会发起翻译请求。"));
     }
 
-    setPanelCollapsed(true, false);
+    card.appendChild(header);
+    card.appendChild(body);
+
+    state.trackCardNodes[trackId] = card;
+    state.trackCardBodyNodes[trackId] = body;
+    state.trackCardStatusNodes[trackId] = status;
+    state.trackToggleButtons[trackId] = toggleButton;
+    state.trackExpandButtons[trackId] = expandButton;
+
+    syncTrackControlBindings(trackId);
+    refreshTrackCardHeader(trackId);
+    updateTrackCardOpenState(trackId);
+
+    return card;
+  }
+
+  function makePanelSection(titleText) {
+    const section = document.createElement("section");
+    section.className = "tb-panel-section";
+
+    const title = document.createElement("div");
+    title.className = "tb-section-title";
+    title.textContent = titleText;
+
+    section.appendChild(title);
+    return section;
+  }
+
+  function makeBlockTitle(titleText) {
+    const title = document.createElement("div");
+    title.className = "tb-block-title";
+    title.textContent = titleText;
+    return title;
+  }
+
+  function makeLauncherButton() {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "tb-launcher";
+    button.textContent = "字幕";
+    button.title = "打开字幕面板";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openPanel();
+    });
+    trapPanelEvents(button);
+    return button;
   }
 
   function makeButton(label, title, onClick) {
@@ -392,267 +672,25 @@
     return button;
   }
 
-  function makeLauncherButton() {
+  function makeMiniButton(label, title, onClick) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "tb-launcher";
-    button.textContent = "TB";
-    button.title = "Open subtitle tools panel";
+    button.className = "tb-button tb-button-mini";
+    button.textContent = label;
+    button.title = title || label;
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openPanel();
+      onClick();
     });
-    trapPanelEvents(button);
     return button;
   }
 
-  function createStylePanel() {
-    state.styleControlBindings = [];
-
-    const controls = document.createElement("div");
-    controls.className = "tb-config-panel";
-
-    const layoutSection = makeSection("Layout");
-    layoutSection.appendChild(makeRangeControl("Base", "fontScale", {
-      min: 0.7,
-      max: 1.8,
-      step: 0.05,
-      format: (value) => `${formatNumber(value, 2)}x`
-    }));
-    layoutSection.appendChild(makeRangeControl("Bottom", "bottomOffsetPx", {
-      min: 0,
-      max: 180,
-      step: 1,
-      format: (value) => `${value}px`
-    }));
-    layoutSection.appendChild(makeRangeControl("Width", "maxWidthPercent", {
-      min: 60,
-      max: 100,
-      step: 1,
-      format: (value) => `${value}%`
-    }));
-    layoutSection.appendChild(makeRangeControl("Gap", "lineGapEm", {
-      min: 0,
-      max: 1,
-      step: 0.05,
-      format: (value) => `${formatNumber(value, 2)}em`
-    }));
-    layoutSection.appendChild(makeSelectControl("Align", "textAlign", [
-      ["left", "Left"],
-      ["center", "Center"],
-      ["right", "Right"]
-    ]));
-    layoutSection.appendChild(makeSelectControl("Breaks", "lineBreakMode", [
-      ["smart", "Smart"],
-      ["raw", "Raw"]
-    ]));
-    layoutSection.appendChild(makeSelectControl("Case", "originalCaseMode", [
-      ["smart", "Smart"],
-      ["raw", "Raw"]
-    ]));
-
-    const originalSection = makeSection("Primary");
-    originalSection.appendChild(makeRangeControl("Size", "originalScale", {
-      min: 0.7,
-      max: 1.8,
-      step: 0.05,
-      format: (value) => `${formatNumber(value, 2)}x`
-    }));
-    originalSection.appendChild(makeRangeControl("Weight", "originalFontWeight", {
-      min: 400,
-      max: 900,
-      step: 100,
-      format: (value) => String(value)
-    }));
-    originalSection.appendChild(makeColorControl("Text", "originalColor"));
-    originalSection.appendChild(makeColorControl("BG", "originalBgColor"));
-    originalSection.appendChild(makeRangeControl("BG alpha", "originalBgOpacity", {
-      min: 0,
-      max: 1,
-      step: 0.05,
-      format: (value) => formatNumber(value, 2)
-    }));
-
-    const translationSection = makeSection("Secondary");
-    translationSection.appendChild(makeRangeControl("Size", "translationScale", {
-      min: 0.7,
-      max: 1.8,
-      step: 0.05,
-      format: (value) => `${formatNumber(value, 2)}x`
-    }));
-    translationSection.appendChild(makeRangeControl("Weight", "translationFontWeight", {
-      min: 400,
-      max: 900,
-      step: 100,
-      format: (value) => String(value)
-    }));
-    translationSection.appendChild(makeColorControl("Text", "translationColor"));
-    translationSection.appendChild(makeColorControl("BG", "translationBgColor"));
-    translationSection.appendChild(makeRangeControl("BG alpha", "translationBgOpacity", {
-      min: 0,
-      max: 1,
-      step: 0.05,
-      format: (value) => formatNumber(value, 2)
-    }));
-
-    const footer = document.createElement("div");
-    footer.className = "tb-style-footer";
-    footer.appendChild(makeSecondaryButton("Reset Styles", "Reset subtitle style settings to defaults", resetStyleSettings));
-
-    controls.appendChild(layoutSection);
-    controls.appendChild(originalSection);
-    controls.appendChild(translationSection);
-    controls.appendChild(footer);
-
-    syncStyleControlBindings();
-    return controls;
-  }
-
-  function createEnginePanel() {
-    state.engineControlBindings = [];
-
-    const controls = document.createElement("div");
-    controls.className = "tb-config-panel";
-
-    const backendSection = makeSection("Translation");
-    backendSection.appendChild(makeEngineSelectControl("Mode", "engine", [
-      ["google-free", "Google Free"],
-      ["openai-compatible", "OpenAI Compatible"]
-    ]));
-
-    const openAISection = makeSection("OpenAI");
-    openAISection.classList.add("tb-engine-openai-only");
-    openAISection.appendChild(makeEngineTextControl("API URL", "openaiApiUrl", {
-      placeholder: "https://api.openai.com/v1/chat/completions"
-    }));
-    openAISection.appendChild(makeEnginePasswordControl("API Key", "openaiApiKey", {
-      placeholder: "sk-..."
-    }));
-    openAISection.appendChild(makeEngineTextControl("Model", "openaiModel", {
-      placeholder: "gpt-4.1-mini"
-    }));
-    openAISection.appendChild(makeEngineNumberControl("Temp", "openaiTemperature", {
-      min: 0,
-      max: 2,
-      step: 0.1
-    }));
-    openAISection.appendChild(makeEngineNumberControl("Timeout", "openaiTimeoutMs", {
-      min: 5000,
-      max: 120000,
-      step: 1000,
-      format: (value) => `${Math.round(value)}ms`
-    }));
-
-    const promptSection = makeSection("Prompt");
-    promptSection.classList.add("tb-engine-openai-only");
-    promptSection.appendChild(makeEngineTextareaControl("System", "openaiSystemPrompt", {
-      rows: 4,
-      placeholder: "Translate subtitles faithfully and return only the translated text."
-    }));
-
-    const testSection = makeSection("Test");
-    testSection.classList.add("tb-engine-openai-only");
-    testSection.appendChild(makeEngineTextareaControl("Sample", "openaiTestText", {
-      rows: 3,
-      placeholder: "Enter a short line to verify the model API.",
-      retranslateOnChange: false
-    }));
-    testSection.appendChild(makeHintText("Send one sample request with the current source and target language settings."));
-
-    const testActions = document.createElement("div");
-    testActions.className = "tb-inline-actions";
-    const testButton = makeSecondaryButton("Test API", "Send a sample request to verify the model API", testOpenAITranslation);
-    testActions.appendChild(testButton);
-    testSection.appendChild(testActions);
-
-    const footer = document.createElement("div");
-    footer.className = "tb-style-footer";
-    footer.appendChild(makeSecondaryButton("Reset Settings", "Reset translation engine settings to defaults", resetEngineSettings));
-
-    controls.appendChild(backendSection);
-    controls.appendChild(openAISection);
-    controls.appendChild(promptSection);
-    controls.appendChild(testSection);
-    controls.appendChild(footer);
-
-    state.engineTestButtonNode = testButton;
-    syncEngineControlBindings();
-    syncEnginePanelState();
-    setEngineTestPending(false);
-    return controls;
-  }
-
-  function makeSection(title) {
-    const section = document.createElement("section");
-    section.className = "tb-section";
-
-    const header = document.createElement("div");
-    header.className = "tb-section-title";
-    header.textContent = title;
-
-    section.appendChild(header);
-    return section;
-  }
-
-  function makeRangeControl(label, key, options) {
-    const input = document.createElement("input");
-    input.type = "range";
-    input.min = String(options.min);
-    input.max = String(options.max);
-    input.step = String(options.step);
-    input.className = "tb-range";
-
-    const valueNode = document.createElement("span");
-    valueNode.className = "tb-control-value";
-
-    registerStyleControlBinding(key, input, valueNode, options.format);
-    input.addEventListener("input", () => {
-      applyStyleSetting(key, Number(input.value), true);
-    });
-    input.addEventListener("change", () => {
-      applyStyleSetting(key, Number(input.value), false);
-    });
-
-    return makeControlRow(label, input, valueNode);
-  }
-
-  function makeSelectControl(label, key, choices) {
-    const select = document.createElement("select");
-    select.className = "tb-select";
-
-    choices.forEach(([value, text]) => {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = text;
-      select.appendChild(option);
-    });
-
-    registerStyleControlBinding(key, select, null, null);
-    select.addEventListener("change", () => {
-      applyStyleSetting(key, select.value, false);
-    });
-
-    return makeControlRow(label, select, null);
-  }
-
-  function makeColorControl(label, key) {
-    const input = document.createElement("input");
-    input.type = "color";
-    input.className = "tb-color";
-
-    const valueNode = document.createElement("span");
-    valueNode.className = "tb-control-value";
-
-    registerStyleControlBinding(key, input, valueNode, (value) => String(value).toUpperCase());
-    input.addEventListener("input", () => {
-      applyStyleSetting(key, input.value, true);
-    });
-    input.addEventListener("change", () => {
-      applyStyleSetting(key, input.value, false);
-    });
-
-    return makeControlRow(label, input, valueNode);
+  function makeHintText(text) {
+    const node = document.createElement("div");
+    node.className = "tb-hint";
+    node.textContent = text;
+    return node;
   }
 
   function makeControlRow(label, input, valueNode) {
@@ -677,81 +715,83 @@
     return row;
   }
 
-  function makeSecondaryButton(label, title, onClick) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "tb-button tb-button-secondary";
-    button.textContent = label;
-    button.title = title || label;
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      onClick();
-    });
-    return button;
+  function makeRangeControl(bindingList, label, options) {
+    const input = document.createElement("input");
+    input.type = "range";
+    input.className = "tb-range";
+    input.min = String(options.min);
+    input.max = String(options.max);
+    input.step = String(options.step);
+
+    const valueNode = document.createElement("span");
+    valueNode.className = "tb-control-value";
+
+    registerBinding(bindingList, options.getValue, input, valueNode, options.format);
+    input.addEventListener("input", () => options.onInput(Number(input.value)));
+    input.addEventListener("change", () => options.onChange(Number(input.value)));
+
+    return makeControlRow(label, input, valueNode);
   }
 
-  function makeHintText(text) {
-    const node = document.createElement("div");
-    node.className = "tb-hint";
-    node.textContent = text;
-    return node;
-  }
-
-  function makeEngineSelectControl(label, key, choices) {
+  function makeSelectControl(bindingList, label, options) {
     const select = document.createElement("select");
     select.className = "tb-select";
 
-    choices.forEach(([value, text]) => {
+    options.choices.forEach(([value, text]) => {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = text;
       select.appendChild(option);
     });
 
-    registerEngineControlBinding(key, select, null, null);
-    select.addEventListener("change", () => {
-      applyEngineSetting(key, select.value, false, true);
-    });
+    registerBinding(bindingList, options.getValue, select, null, null);
+    select.addEventListener("change", () => options.onChange(select.value));
 
     return makeControlRow(label, select, null);
   }
 
-  function makeEngineTextControl(label, key, options) {
+  function makeColorControl(bindingList, label, options) {
+    const input = document.createElement("input");
+    input.type = "color";
+    input.className = "tb-color";
+
+    const valueNode = document.createElement("span");
+    valueNode.className = "tb-control-value";
+
+    registerBinding(bindingList, options.getValue, input, valueNode, options.format || ((value) => String(value).toUpperCase()));
+    input.addEventListener("input", () => options.onInput(input.value));
+    input.addEventListener("change", () => options.onChange(input.value));
+
+    return makeControlRow(label, input, valueNode);
+  }
+
+  function makeTextControl(bindingList, label, options) {
     const input = document.createElement("input");
     input.type = "text";
     input.className = "tb-text-input";
     input.placeholder = options.placeholder || "";
 
-    registerEngineControlBinding(key, input, null, null);
-    input.addEventListener("input", () => {
-      applyEngineSetting(key, input.value, true, false);
-    });
-    input.addEventListener("change", () => {
-      applyEngineSetting(key, input.value, false, true);
-    });
+    registerBinding(bindingList, options.getValue, input, null, null);
+    input.addEventListener("input", () => options.onInput(input.value));
+    input.addEventListener("change", () => options.onChange(input.value));
 
     return makeControlRow(label, input, null);
   }
 
-  function makeEnginePasswordControl(label, key, options) {
+  function makePasswordControl(bindingList, label, options) {
     const input = document.createElement("input");
     input.type = "password";
     input.className = "tb-text-input";
     input.placeholder = options.placeholder || "";
 
-    registerEngineControlBinding(key, input, null, null);
-    input.addEventListener("input", () => {
-      applyEngineSetting(key, input.value, true, false);
-    });
-    input.addEventListener("change", () => {
-      applyEngineSetting(key, input.value, false, true);
-    });
+    registerBinding(bindingList, options.getValue, input, null, null);
+    input.addEventListener("input", () => options.onInput(input.value));
+    input.addEventListener("change", () => options.onChange(input.value));
 
     return makeControlRow(label, input, null);
   }
 
-  function makeEngineNumberControl(label, key, options) {
+  function makeNumberControl(bindingList, label, options) {
     const input = document.createElement("input");
     input.type = "number";
     input.className = "tb-text-input";
@@ -762,164 +802,394 @@
     const valueNode = document.createElement("span");
     valueNode.className = "tb-control-value";
 
-    registerEngineControlBinding(key, input, valueNode, options.format || null);
-    input.addEventListener("input", () => {
-      applyEngineSetting(key, Number(input.value), true, false);
-    });
-    input.addEventListener("change", () => {
-      applyEngineSetting(key, Number(input.value), false, true);
-    });
+    registerBinding(bindingList, options.getValue, input, valueNode, options.format || null);
+    input.addEventListener("input", () => options.onInput(Number(input.value)));
+    input.addEventListener("change", () => options.onChange(Number(input.value)));
 
     return makeControlRow(label, input, valueNode);
   }
 
-  function makeEngineTextareaControl(label, key, options) {
+  function makeTextareaControl(bindingList, label, options) {
     const input = document.createElement("textarea");
     input.className = "tb-textarea";
     input.rows = options.rows || 4;
     input.placeholder = options.placeholder || "";
 
-    registerEngineControlBinding(key, input, null, null);
-    input.addEventListener("input", () => {
-      applyEngineSetting(key, input.value, true, false);
-    });
-    input.addEventListener("change", () => {
-      applyEngineSetting(key, input.value, false, options.retranslateOnChange !== false);
-    });
+    registerBinding(bindingList, options.getValue, input, null, null);
+    input.addEventListener("input", () => options.onInput(input.value));
+    input.addEventListener("change", () => options.onChange(input.value));
 
     return makeControlRow(label, input, null);
   }
 
-  function registerStyleControlBinding(key, input, valueNode, format) {
-    state.styleControlBindings.push({
-      key,
+  function registerBinding(bindingList, getValue, input, valueNode, format) {
+    bindingList.push({
+      getValue,
       input,
       valueNode,
       format
     });
   }
 
-  function registerEngineControlBinding(key, input, valueNode, format) {
-    state.engineControlBindings.push({
-      key,
-      input,
-      valueNode,
-      format
-    });
+  function syncLayoutControlBindings() {
+    syncControlBindings(state.layoutControlBindings);
   }
 
-  function syncStyleControlBindings() {
-    state.styleControlBindings.forEach((binding) => {
-      syncBoundControl(binding, state.settings[binding.key]);
-    });
+  function syncTrackControlBindings(trackId) {
+    syncControlBindings(state.trackControlBindings[trackId] || []);
   }
 
-  function syncEngineControlBindings() {
-    state.engineControlBindings.forEach((binding) => {
-      syncBoundControl(binding, state.settings[binding.key]);
+  function syncControlBindings(bindings) {
+    bindings.forEach((binding) => {
+      syncBoundControl(binding, binding.getValue());
     });
   }
 
   function syncBoundControl(binding, value) {
-    const isFocusedTextField = document.activeElement === binding.input && (binding.input.tagName === "INPUT" || binding.input.tagName === "TEXTAREA");
+    const isFocusedTextField = document.activeElement === binding.input &&
+      (binding.input.tagName === "INPUT" || binding.input.tagName === "TEXTAREA");
 
-    if (!isFocusedTextField && (binding.input.type === "range" || binding.input.type === "color" || binding.input.type === "number" || binding.input.tagName === "SELECT" || binding.input.tagName === "TEXTAREA" || binding.input.tagName === "INPUT")) {
+    if (!isFocusedTextField) {
       binding.input.value = String(value ?? "");
     }
 
     if (binding.valueNode) {
-      binding.valueNode.textContent = binding.format ? binding.format(value) : String(value);
+      binding.valueNode.textContent = binding.format ? binding.format(value) : String(value ?? "");
     }
-  }
-
-  function syncEnginePanelState() {
-    if (!state.engineControlsNode) {
-      return;
-    }
-
-    const usesOpenAI = state.settings.engine === "openai-compatible";
-    Array.from(state.engineControlsNode.querySelectorAll(".tb-engine-openai-only")).forEach((node) => {
-      node.classList.toggle("tb-hidden", !usesOpenAI);
-    });
   }
 
   function refreshActionButtons() {
-    const buttons = state.actionButtons;
-    if (!buttons || !buttons.manualUrlButton) {
+    const { retryButton, hideButton } = state.actionButtons;
+    if (!retryButton || !hideButton) {
       return;
     }
 
-    setButtonPresentation(
-      buttons.manualUrlButton,
-      "Subtitle URL",
-      state.settings.manualSubtitleUrl
-        ? `Current manual subtitle URL: ${state.settings.manualSubtitleUrl}`
-        : "Set a manual subtitle file URL"
-    );
-    setButtonPresentation(
-      buttons.targetLangButton,
-      "Target Language",
-      `Current target language: ${state.settings.targetLang}`
-    );
-    setButtonPresentation(
-      buttons.engineButton,
-      "Engine Settings",
-      `Current translation engine: ${getEngineLabel(state.settings.engine)}. Open translation engine settings.`
-    );
-    setButtonPresentation(
-      buttons.retryButton,
-      "Reload Subtitle",
-      "Reload the last detected subtitle file"
-    );
-    setButtonPresentation(
-      buttons.originalButton,
-      state.settings.showOriginal ? "Original: On" : "Original: Off",
-      state.settings.showOriginal ? "Hide the original subtitle line" : "Show the original subtitle line"
-    );
-    setButtonPresentation(
-      buttons.translationButton,
-      state.settings.showTranslation ? "Translation: On" : "Translation: Off",
-      state.settings.showTranslation ? "Hide the translated subtitle line" : "Show the translated subtitle line"
-    );
-    setButtonPresentation(
-      buttons.styleButton,
-      "Style Panel",
-      "Open subtitle style settings"
-    );
-    setButtonPresentation(
-      buttons.hideButton,
-      "Hide Panel",
-      "Hide the subtitle tools panel"
-    );
-    setButtonPresentation(
-      buttons.exportButton,
-      "Export SRT",
-      "Export the current bilingual subtitles as an SRT file"
-    );
+    retryButton.textContent = "重新载入字幕";
+    retryButton.title = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl
+      ? "重新请求当前字幕文件"
+      : "等待自动检测到字幕文件";
+
+    hideButton.textContent = "收起面板";
+    hideButton.title = "隐藏面板，只保留启动按钮";
   }
 
-  function setButtonPresentation(button, label, title) {
-    button.textContent = label;
-    button.title = title || label;
+  function toggleLayoutSection() {
+    state.settings.layoutPanelOpen = !state.settings.layoutPanelOpen;
+    saveSettings();
+    refreshLayoutSectionState();
   }
 
-  function setEngineTestPending(pending) {
-    state.engineTestPending = pending;
-
-    if (!state.engineTestButtonNode) {
+  function refreshLayoutSectionState() {
+    const section = state.layoutSectionNode;
+    const body = state.layoutSectionBodyNode;
+    const toggleButton = state.layoutSectionToggleButton;
+    if (!section || !body || !toggleButton) {
       return;
     }
 
-    state.engineTestButtonNode.disabled = pending;
-    state.engineTestButtonNode.textContent = pending ? "Testing..." : "Test API";
+    const open = Boolean(state.settings.layoutPanelOpen);
+    section.classList.toggle("tb-panel-section-open", open);
+    body.classList.toggle("tb-hidden", !open);
+    toggleButton.textContent = open ? "收起" : "展开";
+    toggleButton.title = open ? "收起全局布局设置" : "展开全局布局设置";
   }
 
-  function toggleStylePanel() {
-    setStylePanelVisible(!state.settings.stylePanelOpen, true);
+  function refreshAllTrackCardHeaders() {
+    TRACK_ORDER.forEach((trackId) => refreshTrackCardHeader(trackId));
   }
 
-  function toggleEnginePanel() {
-    setEnginePanelVisible(!state.settings.enginePanelOpen, true);
+  function refreshTrackCardHeader(trackId) {
+    const card = state.trackCardNodes[trackId];
+    const statusNode = state.trackCardStatusNodes[trackId];
+    const toggleButton = state.trackToggleButtons[trackId];
+    const expandButton = state.trackExpandButtons[trackId];
+    const testButton = state.trackTestButtons[trackId];
+    const track = state.settings.tracks[trackId];
+
+    if (!card || !statusNode || !toggleButton || !expandButton || !track) {
+      return;
+    }
+
+    const status = computeTrackStatus(trackId);
+    statusNode.textContent = status.text;
+    statusNode.title = status.title;
+
+    toggleButton.textContent = track.enabled ? "关闭" : "开启";
+    toggleButton.title = track.enabled ? `关闭 ${TRACK_META[trackId].label}` : `开启 ${TRACK_META[trackId].label}`;
+
+    expandButton.textContent = state.openCards.has(trackId) ? "收起" : "展开";
+    expandButton.title = state.openCards.has(trackId) ? `收起 ${TRACK_META[trackId].label} 配置` : `展开 ${TRACK_META[trackId].label} 配置`;
+
+    card.classList.toggle("tb-track-card-enabled", track.enabled);
+    card.classList.toggle("tb-track-card-open", state.openCards.has(trackId));
+
+    if (testButton) {
+      const pending = state.trackRuntimes[trackId].testPending;
+      testButton.disabled = pending;
+      testButton.textContent = pending ? "测试中..." : "测试接口";
+    }
+  }
+
+  function computeTrackStatus(trackId) {
+    const track = state.settings.tracks[trackId];
+    const runtime = state.trackRuntimes[trackId];
+
+    if (!track.enabled) {
+      return {
+        text: "已关闭",
+        title: `${TRACK_META[trackId].label} 当前不会显示`
+      };
+    }
+
+    if (trackId === "source") {
+      if (!state.cues.length) {
+        return {
+          text: "等待字幕",
+          title: "等待自动检测字幕文件"
+        };
+      }
+
+      if (state.activeCueIndex === -1) {
+        return {
+          text: `已载入 ${state.cues.length} 条`,
+          title: `已载入 ${state.cues.length} 条原始字幕`
+        };
+      }
+
+      return {
+        text: state.renderedTrackTexts.source ? "显示中" : "待显示",
+        title: state.renderedTrackTexts.source ? "当前原文字幕正在显示" : "当前时间点没有原文字幕可显示"
+      };
+    }
+
+    if (runtime.testPending) {
+      return {
+        text: "测试中",
+        title: "正在测试模型接口"
+      };
+    }
+
+    const configError = isModelTrack(trackId) ? getTrackOpenAIConfigError(trackId) : "";
+    if (configError) {
+      return {
+        text: "未配置",
+        title: configError
+      };
+    }
+
+    if (!state.cues.length) {
+      return {
+        text: "等待字幕",
+        title: "等待自动检测字幕文件"
+      };
+    }
+
+    if (runtime.inFlight) {
+      return {
+        text: "翻译中",
+        title: "正在按播放进度翻译附近字幕"
+      };
+    }
+
+    if (runtime.lastError) {
+      return {
+        text: "请求失败",
+        title: runtime.lastError
+      };
+    }
+
+    if (state.activeCueIndex !== -1 && state.renderedTrackTexts[trackId]) {
+      return {
+        text: "显示中",
+        title: `当前 ${TRACK_META[trackId].label} 正在显示`
+      };
+    }
+
+    return {
+      text: "待翻译",
+      title: "已启用，将按播放进度逐步翻译"
+    };
+  }
+
+  function getTrackMetaText(trackId) {
+    if (trackId === "source") {
+      return "直接显示捕获到的原始字幕";
+    }
+
+    if (trackId === "google") {
+      return "内置 Google Translate，固定翻译为简体中文";
+    }
+
+    return "OpenAI-compatible 模型接口，固定翻译为简体中文";
+  }
+
+  function toggleTrackCard(trackId) {
+    if (state.openCards.has(trackId)) {
+      state.openCards.delete(trackId);
+    } else {
+      state.openCards.add(trackId);
+    }
+
+    updateTrackCardOpenState(trackId);
+    refreshTrackCardHeader(trackId);
+  }
+
+  function updateTrackCardOpenState(trackId) {
+    const body = state.trackCardBodyNodes[trackId];
+    if (!body) {
+      return;
+    }
+
+    body.classList.toggle("tb-hidden", !state.openCards.has(trackId));
+  }
+
+  function applyLayoutSetting(key, value, deferSave) {
+    state.settings.layout[key] = normalizeLayoutValue(key, value);
+
+    if (deferSave) {
+      scheduleSettingsSave();
+    } else {
+      saveSettings();
+    }
+
+    syncLayoutControlBindings();
+    applySubtitleStyles();
+    syncOverlayLayout();
+    state.cueKey = "";
+    renderActiveCue();
+  }
+
+  function applyTrackStyleSetting(trackId, key, value, deferSave) {
+    state.settings.tracks[trackId].style[key] = normalizeTrackStyleValue(key, value);
+
+    if (deferSave) {
+      scheduleSettingsSave();
+    } else {
+      saveSettings();
+    }
+
+    syncTrackControlBindings(trackId);
+    applySubtitleStyles();
+    syncOverlayLayout();
+    state.cueKey = "";
+    renderActiveCue();
+  }
+
+  function applyModelSetting(trackId, key, value, deferSave, retranslate) {
+    const track = state.settings.tracks[trackId];
+    track[key] = normalizeModelSettingValue(key, value);
+
+    if (deferSave) {
+      scheduleSettingsSave();
+    } else {
+      saveSettings();
+    }
+
+    syncTrackControlBindings(trackId);
+    refreshTrackCardHeader(trackId);
+
+    if (!retranslate) {
+      return;
+    }
+
+    resetTrackTranslationRuntime(trackId);
+    state.cueKey = "";
+    renderActiveCue();
+
+    const configError = getTrackOpenAIConfigError(trackId);
+    if (configError) {
+      setStatus(`${TRACK_META[trackId].label} 配置不完整：${configError}`);
+      refreshTrackCardHeader(trackId);
+      return;
+    }
+
+    setStatus(`${TRACK_META[trackId].label} 配置已更新`);
+
+    if (track.enabled && state.cues.length) {
+      pumpTrackProgressiveTranslation(trackId);
+    }
+  }
+
+  function toggleTrackEnabled(trackId) {
+    const track = state.settings.tracks[trackId];
+    track.enabled = !track.enabled;
+    saveSettings();
+
+    if (trackId !== "source") {
+      resetTrackTranslationRuntime(trackId);
+    }
+
+    state.cueKey = "";
+    renderActiveCue();
+    refreshTrackCardHeader(trackId);
+
+    if (!track.enabled) {
+      setStatus(`${TRACK_META[trackId].label} 已关闭`);
+      return;
+    }
+
+    if (trackId === "source") {
+      setStatus("源字幕已开启");
+      return;
+    }
+
+    const configError = isModelTrack(trackId) ? getTrackOpenAIConfigError(trackId) : "";
+    if (configError) {
+      setStatus(`${TRACK_META[trackId].label} 已开启，但尚未配置完成`);
+      refreshTrackCardHeader(trackId);
+      return;
+    }
+
+    setStatus(`${TRACK_META[trackId].label} 已开启`);
+
+    if (state.cues.length) {
+      pumpTrackProgressiveTranslation(trackId);
+    }
+  }
+
+  function testModelTrack(trackId) {
+    if (!isModelTrack(trackId)) {
+      return;
+    }
+
+    const runtime = state.trackRuntimes[trackId];
+    if (runtime.testPending) {
+      return;
+    }
+
+    const configError = getTrackOpenAIConfigError(trackId);
+    if (configError) {
+      setStatus(`${TRACK_META[trackId].label} 配置不完整：${configError}`);
+      refreshTrackCardHeader(trackId);
+      return;
+    }
+
+    const sampleText = String(state.settings.tracks[trackId].testText || "").trim();
+    if (!sampleText) {
+      setStatus(`${TRACK_META[trackId].label} 需要先填写测试文本`);
+      return;
+    }
+
+    setTrackTestPending(trackId, true);
+    setStatus(`正在测试 ${TRACK_META[trackId].label} 接口...`);
+
+    void (async () => {
+      try {
+        const translated = normalizeTranslation(await translateSingleTextWithOpenAI(trackId, sampleText));
+        setStatus(`${TRACK_META[trackId].label} 测试成功：${summarizeStatusText(translated, 80)}`);
+      } catch (error) {
+        setStatus(`${TRACK_META[trackId].label} 测试失败：${error.message}`);
+        state.trackRuntimes[trackId].lastError = error.message;
+      } finally {
+        setTrackTestPending(trackId, false);
+        refreshTrackCardHeader(trackId);
+      }
+    })();
+  }
+
+  function setTrackTestPending(trackId, pending) {
+    state.trackRuntimes[trackId].testPending = pending;
+    refreshTrackCardHeader(trackId);
   }
 
   function togglePanelCollapsed() {
@@ -934,42 +1204,6 @@
     setPanelCollapsed(true, true);
   }
 
-  function setStylePanelVisible(visible, persist) {
-    state.settings.stylePanelOpen = visible;
-    state.settings.enginePanelOpen = false;
-    updateConfigPanelVisibility();
-
-    if (persist) {
-      saveSettings();
-    }
-  }
-
-  function setEnginePanelVisible(visible, persist) {
-    state.settings.enginePanelOpen = visible;
-    state.settings.stylePanelOpen = false;
-    updateConfigPanelVisibility();
-
-    if (persist) {
-      saveSettings();
-    }
-  }
-
-  function updateConfigPanelVisibility() {
-    if (state.styleControlsNode) {
-      state.styleControlsNode.classList.toggle("tb-hidden", !state.settings.stylePanelOpen);
-    }
-
-    if (state.engineControlsNode) {
-      state.engineControlsNode.classList.toggle("tb-hidden", !state.settings.enginePanelOpen);
-    }
-
-    if (state.panelNode) {
-      state.panelNode.classList.toggle("tb-panel-expanded", state.settings.stylePanelOpen || state.settings.enginePanelOpen);
-    }
-
-    syncEnginePanelState();
-  }
-
   function setPanelCollapsed(collapsed, persist) {
     state.settings.panelCollapsed = collapsed;
 
@@ -979,7 +1213,7 @@
 
     if (state.panelToggleNode) {
       state.panelToggleNode.classList.toggle("tb-hidden", !collapsed);
-      state.panelToggleNode.title = collapsed ? "Open subtitle tools" : "Subtitle tools open";
+      state.panelToggleNode.title = collapsed ? "打开字幕面板" : "字幕面板已展开";
     }
 
     if (persist) {
@@ -987,146 +1221,48 @@
     }
   }
 
-  function applyStyleSetting(key, value, deferSave) {
-    state.settings[key] = value;
-
-    if (deferSave) {
-      scheduleSettingsSave();
-    } else {
-      saveSettings();
-    }
-
-    syncStyleControlBindings();
-    applySubtitleStyles();
-    syncOverlayLayout();
-    renderActiveCue();
-  }
-
-  function resetStyleSettings() {
-    STYLE_SETTING_KEYS.forEach((key) => {
-      state.settings[key] = DEFAULT_SETTINGS[key];
-    });
-
-    saveSettings();
-    syncStyleControlBindings();
-    applySubtitleStyles();
-    syncOverlayLayout();
-    renderActiveCue();
-    setStatus("Subtitle styles reset");
-  }
-
-  function applyEngineSetting(key, value, deferSave, retranslate) {
-    state.settings[key] = normalizeEngineSettingValue(key, value);
-
-    if (deferSave) {
-      scheduleSettingsSave();
-    } else {
-      saveSettings();
-    }
-
-    syncEngineControlBindings();
-    syncEnginePanelState();
-    refreshActionButtons();
-
-    if (!retranslate) {
+  function retryLastSubtitle() {
+    const url = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl;
+    if (!url) {
+      setStatus("尚未检测到字幕地址");
       return;
     }
 
-    if (key === "engine") {
-      const configError = getOpenAIConfigError();
-      if (state.settings.engine === "openai-compatible" && configError) {
-        state.cueKey = "";
-        renderActiveCue();
-        setStatus(configError);
-        return;
-      }
-
-      applyTranslationSettingChange(`Translation engine set to ${getEngineLabel(state.settings.engine)}`);
-      return;
-    }
-
-    if (state.settings.engine !== "openai-compatible") {
-      setStatus("Engine settings saved");
-      return;
-    }
-
-    const configError = getOpenAIConfigError();
-    if (configError) {
-      state.cueKey = "";
-      renderActiveCue();
-      setStatus(configError);
-      return;
-    }
-
-    applyTranslationSettingChange("OpenAI translation settings updated");
-  }
-
-  function resetEngineSettings() {
-    ENGINE_SETTING_KEYS.forEach((key) => {
-      state.settings[key] = DEFAULT_SETTINGS[key];
-    });
-
-    saveSettings();
-    syncEngineControlBindings();
-    syncEnginePanelState();
-    refreshActionButtons();
-
-    if (state.cues.length) {
-      applyTranslationSettingChange("Translation engine settings reset");
-      return;
-    }
-
-    state.cueKey = "";
-    renderActiveCue();
-    setStatus("Translation engine settings reset");
-  }
-
-  async function testOpenAITranslation() {
-    if (state.engineTestPending) {
-      return;
-    }
-
-    if (state.settings.engine !== "openai-compatible") {
-      setStatus("Switch the engine to OpenAI Compatible before testing the model API");
-      return;
-    }
-
-    const configError = getOpenAIConfigError();
-    if (configError) {
-      setStatus(configError);
-      return;
-    }
-
-    const sampleText = String(state.settings.openaiTestText || "").trim();
-    if (!sampleText) {
-      setStatus("Enter sample text before testing the model API");
-      return;
-    }
-
-    setEngineTestPending(true);
-    setStatus("Testing OpenAI-compatible model API...");
-
-    try {
-      const translated = normalizeTranslation(await translateSingleTextWithOpenAI(sampleText));
-      setStatus(`Model test OK: ${summarizeStatusText(translated, 90)}`);
-      console.info("[TB] OpenAI model test succeeded", {
-        sampleText,
-        translated
-      });
-    } catch (error) {
-      setStatus(`Model test failed: ${error.message}`);
-      console.error("[TB] OpenAI model test failed", error);
-    } finally {
-      setEngineTestPending(false);
-    }
+    loadSubtitleFromUrl(url, "重新载入");
   }
 
   function trapPanelEvents(node) {
-    ["click", "mousedown", "mouseup", "pointerdown", "pointerup", "touchstart"].forEach((eventName) => {
+    ["click", "mousedown", "mouseup", "pointerdown", "pointerup", "touchstart", "keydown", "keypress", "keyup"].forEach((eventName) => {
       node.addEventListener(eventName, (event) => {
         event.stopPropagation();
       });
     });
+  }
+
+  function bindKeyboardEventGuard() {
+    const guardTargets = [window, document];
+    ["keydown", "keypress", "keyup"].forEach((eventName) => {
+      guardTargets.forEach((target) => {
+        target.addEventListener(eventName, (event) => {
+          if (!isOverlayKeyboardTarget(event.target)) {
+            return;
+          }
+
+          event.stopPropagation();
+          if (typeof event.stopImmediatePropagation === "function") {
+            event.stopImmediatePropagation();
+          }
+        }, true);
+      });
+    });
+  }
+
+  function isOverlayKeyboardTarget(target) {
+    if (!state.overlayRoot || !(target instanceof Node)) {
+      return false;
+    }
+
+    return state.overlayRoot.contains(target);
   }
 
   function syncOverlayLayout() {
@@ -1148,10 +1284,50 @@
     state.overlayRoot.style.width = `${videoRect.width}px`;
     state.overlayRoot.style.height = `${videoRect.height}px`;
 
-    const fontSize = Math.max(18, Math.round(videoRect.width * 0.028 * state.settings.fontScale));
-    state.subtitleBox.style.paddingBottom = `${state.settings.bottomOffsetPx}px`;
-    state.originalNode.style.fontSize = `${Math.round(fontSize * state.settings.originalScale)}px`;
-    state.translationNode.style.fontSize = `${Math.round(fontSize * state.settings.translationScale)}px`;
+    const fontSize = Math.max(18, Math.round(videoRect.width * 0.028 * state.settings.layout.fontScale));
+    state.subtitleBox.style.paddingBottom = `${state.settings.layout.bottomOffsetPx}px`;
+
+    TRACK_ORDER.forEach((trackId) => {
+      const node = state.trackNodes[trackId];
+      if (!node) {
+        return;
+      }
+
+      node.style.fontSize = `${Math.round(fontSize * state.settings.tracks[trackId].style.scale)}px`;
+    });
+  }
+
+  function applySubtitleStyles() {
+    if (!state.subtitleBox) {
+      return;
+    }
+
+    state.subtitleBox.style.gap = `${state.settings.layout.lineGapEm}em`;
+    state.subtitleBox.style.textAlign = state.settings.layout.textAlign;
+    state.subtitleBox.style.alignItems = mapTextAlignToFlexAlignment(state.settings.layout.textAlign);
+
+    TRACK_ORDER.forEach((trackId) => {
+      const node = state.trackNodes[trackId];
+      if (!node) {
+        return;
+      }
+
+      applyLineStyles(node, {
+        widthPercent: state.settings.layout.maxWidthPercent,
+        color: state.settings.tracks[trackId].style.color,
+        bgColor: state.settings.tracks[trackId].style.bgColor,
+        bgOpacity: state.settings.tracks[trackId].style.bgOpacity,
+        fontWeight: state.settings.tracks[trackId].style.fontWeight
+      });
+    });
+  }
+
+  function applyLineStyles(node, options) {
+    node.style.width = "fit-content";
+    node.style.maxWidth = `${options.widthPercent}%`;
+    node.style.color = options.color;
+    node.style.background = hexToRgba(options.bgColor, options.bgOpacity);
+    node.style.fontWeight = String(options.fontWeight);
   }
 
   function renderActiveCue() {
@@ -1167,28 +1343,43 @@
     }
 
     state.activeCueIndex = cueIndex;
-
     const cue = state.cues[cueIndex];
-    const originalText = state.settings.showOriginal ? formatOriginalTextForDisplay(cue.text) : "";
-    const translatedText = state.settings.showTranslation ? formatTranslatedTextForDisplay(getCachedTranslation(cue.text)) : "";
-    const nextKey = `${cueIndex}|${originalText}|${translatedText}`;
+    const rendered = createTrackTextMap("");
 
+    TRACK_ORDER.forEach((trackId) => {
+      if (!state.settings.tracks[trackId].enabled) {
+        return;
+      }
+
+      if (trackId === "source") {
+        rendered.source = formatOriginalTextForDisplay(cue.text);
+        return;
+      }
+
+      const cached = getCachedTranslation(trackId, cue.text);
+      if (cached) {
+        rendered[trackId] = formatTranslatedTextForDisplay(cached);
+      }
+    });
+
+    const nextKey = `${cueIndex}|${TRACK_ORDER.map((trackId) => `${trackId}:${rendered[trackId]}`).join("|")}`;
     if (nextKey === state.cueKey) {
       return;
     }
 
     state.cueKey = nextKey;
+    state.renderedTrackTexts = rendered;
 
-    const showOriginal = Boolean(originalText);
-    const showTranslation = Boolean(translatedText);
+    let hasVisibleTrack = false;
+    TRACK_ORDER.forEach((trackId) => {
+      const node = state.trackNodes[trackId];
+      const text = rendered[trackId];
+      node.textContent = text;
+      node.style.display = text ? "block" : "none";
+      hasVisibleTrack = hasVisibleTrack || Boolean(text);
+    });
 
-    state.originalNode.textContent = originalText;
-    state.originalNode.style.display = showOriginal ? "block" : "none";
-
-    state.translationNode.textContent = translatedText;
-    state.translationNode.style.display = showTranslation ? "block" : "none";
-
-    state.subtitleBox.style.display = (showOriginal || showTranslation) ? "flex" : "none";
+    state.subtitleBox.style.display = hasVisibleTrack ? "flex" : "none";
   }
 
   function clearRenderedCue() {
@@ -1202,10 +1393,18 @@
 
     state.cueKey = "";
     state.activeCueIndex = -1;
-    state.originalNode.textContent = "";
-    state.translationNode.textContent = "";
-    state.originalNode.style.display = "none";
-    state.translationNode.style.display = "none";
+    state.renderedTrackTexts = createTrackTextMap("");
+
+    TRACK_ORDER.forEach((trackId) => {
+      const node = state.trackNodes[trackId];
+      if (!node) {
+        return;
+      }
+
+      node.textContent = "";
+      node.style.display = "none";
+    });
+
     state.subtitleBox.style.display = "none";
   }
 
@@ -1281,28 +1480,31 @@
     }
 
     state.lastDetectedSubtitleUrl = normalized;
+    refreshActionButtons();
 
     if (normalized === state.currentSubtitleUrl) {
       return;
     }
 
-    loadSubtitleFromUrl(normalized, "auto-detected");
+    loadSubtitleFromUrl(normalized, "自动检测");
   }
 
   async function loadSubtitleFromUrl(url, reason) {
     const normalized = normalizeUrl(url);
     if (!normalized) {
-      setStatus("Invalid subtitle URL");
+      setStatus("字幕地址无效");
       return;
     }
 
     const token = ++state.sourceToken;
+    resetAllTrackTranslationRuntimes();
     state.currentSubtitleUrl = normalized;
     state.lastDetectedSubtitleUrl = normalized;
     state.cues = [];
     state.cueKey = "";
     clearRenderedCue();
-    setStatus(`Loading subtitles (${reason})`);
+    refreshActionButtons();
+    setStatus(`正在加载字幕（${reason}）`);
 
     try {
       const subtitleText = await requestText(normalized);
@@ -1312,12 +1514,13 @@
 
       const cues = parseSubtitleText(subtitleText, normalized);
       if (!cues.length) {
-        throw new Error("No cues found");
+        throw new Error("未找到可用字幕条目");
       }
 
       state.cues = cues;
-      setStatus(`Loaded ${cues.length} cues`);
+      setStatus(`已载入 ${cues.length} 条字幕，正在按需翻译`);
       renderActiveCue();
+      pumpProgressiveTranslation();
     } catch (error) {
       if (token !== state.sourceToken) {
         return;
@@ -1326,118 +1529,227 @@
       state.currentSubtitleUrl = "";
       state.cues = [];
       clearRenderedCue();
-      setStatus(`Subtitle load failed: ${error.message}`);
+      refreshActionButtons();
+      setStatus(`字幕加载失败：${error.message}`);
       console.error("[TB] Subtitle load failed", error);
-      return;
-    }
-
-    try {
-      await translateMissingCues(token);
-    } catch (error) {
-      if (token !== state.sourceToken) {
-        return;
-      }
-
-      setStatus(`Translation failed: ${error.message}`);
-      console.error("[TB] Translation failed", error);
     }
   }
 
-  async function translateMissingCues(token) {
-    const uniqueTexts = [];
-    const seen = new Set();
+  function pumpProgressiveTranslation() {
+    TRANSLATION_TRACK_IDS.forEach((trackId) => {
+      pumpTrackProgressiveTranslation(trackId);
+    });
+  }
 
-    for (const cue of state.cues) {
-      const textForTranslation = normalizeCueTextForTranslation(cue.text);
+  function pumpTrackProgressiveTranslation(trackId) {
+    const track = state.settings.tracks[trackId];
+    const runtime = state.trackRuntimes[trackId];
 
-      if (!shouldTranslate(textForTranslation) || seen.has(textForTranslation) || getCachedTranslation(cue.text)) {
-        continue;
-      }
-
-      seen.add(textForTranslation);
-      uniqueTexts.push(textForTranslation);
-    }
-
-    if (!uniqueTexts.length) {
-      setStatus(`Ready (${state.cues.length} cues)`);
-      renderActiveCue();
+    if (!track?.enabled || !state.cues.length || !state.video || runtime.inFlight) {
       return;
     }
 
-    const batches = buildBatches(uniqueTexts, state.settings.batchChars);
-    let translatedCount = 0;
+    if (Date.now() < runtime.nextAttemptAt) {
+      return;
+    }
 
-    for (const batch of batches) {
-      if (token !== state.sourceToken) {
-        return;
+    const configError = isModelTrack(trackId) ? getTrackOpenAIConfigError(trackId) : "";
+    if (configError) {
+      return;
+    }
+
+    const batch = buildTrackProgressiveTranslationBatch(trackId, state.video.currentTime);
+    if (!batch) {
+      return;
+    }
+
+    void runTrackProgressiveTranslationBatch(trackId, batch, state.sourceToken, runtime.sessionToken);
+  }
+
+  function buildTrackProgressiveTranslationBatch(trackId, currentTime) {
+    if (!state.cues.length) {
+      return null;
+    }
+
+    const runtime = state.trackRuntimes[trackId];
+    const safeTime = Number.isFinite(currentTime) ? currentTime : 0;
+    const anchorIndex = findTranslationAnchorIndex(safeTime);
+    if (anchorIndex === -1) {
+      return null;
+    }
+
+    const texts = [];
+    const keys = [];
+    const seenTexts = new Set();
+    const startIndex = Math.max(0, anchorIndex - TRANSLATION_BACKTRACK_CUES);
+    const horizonTime = Math.max(0, safeTime) + TRANSLATION_LOOKAHEAD_SECONDS;
+    let batchSize = 0;
+    let firstPendingCueStart = Number.POSITIVE_INFINITY;
+    let hitBatchCharLimit = false;
+
+    for (let index = startIndex; index < state.cues.length; index += 1) {
+      const cue = state.cues[index];
+      const cuesAhead = index - anchorIndex;
+      const beyondTimeWindow = index > anchorIndex && cue.start > horizonTime;
+      const beyondCueWindow = cuesAhead >= TRANSLATION_LOOKAHEAD_CUES;
+
+      if (beyondTimeWindow && beyondCueWindow) {
+        break;
       }
 
-      setStatus(`Translating ${translatedCount}/${uniqueTexts.length}`);
+      const textForTranslation = normalizeCueTextForTranslation(cue.text);
+      if (!shouldTranslate(textForTranslation) || seenTexts.has(textForTranslation)) {
+        continue;
+      }
 
-      const translations = await translateBatch(batch);
-      if (token !== state.sourceToken) {
+      seenTexts.add(textForTranslation);
+
+      const cacheKey = buildCacheKeyFromNormalizedText(trackId, textForTranslation);
+      if (hasCachedTranslationByKey(cacheKey) || runtime.pendingKeys.has(cacheKey)) {
+        continue;
+      }
+
+      firstPendingCueStart = Math.min(firstPendingCueStart, cue.start);
+
+      const size = textForTranslation.length + 24;
+      if (texts.length && batchSize + size > state.settings.batchChars) {
+        hitBatchCharLimit = true;
+        break;
+      }
+
+      texts.push(textForTranslation);
+      keys.push(cacheKey);
+      batchSize += size;
+    }
+
+    if (!texts.length) {
+      return null;
+    }
+
+    if (!shouldDispatchProgressiveBatch({
+      textCount: texts.length,
+      currentTime: safeTime,
+      firstPendingCueStart,
+      hitBatchCharLimit
+    })) {
+      return null;
+    }
+
+    return {
+      texts,
+      keys,
+      anchorTime: safeTime
+    };
+  }
+
+  function shouldDispatchProgressiveBatch({ textCount, currentTime, firstPendingCueStart, hitBatchCharLimit }) {
+    if (!textCount) {
+      return false;
+    }
+
+    if (hitBatchCharLimit || textCount >= TRANSLATION_MIN_BATCH_CUES) {
+      return true;
+    }
+
+    if (!Number.isFinite(firstPendingCueStart)) {
+      return true;
+    }
+
+    return firstPendingCueStart <= currentTime + TRANSLATION_URGENT_LEAD_SECONDS;
+  }
+
+  function findTranslationAnchorIndex(time) {
+    const activeIndex = findCueIndex(time);
+    if (activeIndex !== -1) {
+      return activeIndex;
+    }
+
+    let low = 0;
+    let high = state.cues.length - 1;
+    let result = state.cues.length;
+
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (state.cues[mid].start < time) {
+        low = mid + 1;
+      } else {
+        result = mid;
+        high = mid - 1;
+      }
+    }
+
+    return result < state.cues.length ? result : -1;
+  }
+
+  async function runTrackProgressiveTranslationBatch(trackId, batch, subtitleToken, runtimeToken) {
+    const runtime = state.trackRuntimes[trackId];
+    const jobId = ++runtime.jobSeq;
+    runtime.inFlight = true;
+    runtime.activeJobId = jobId;
+    runtime.lastError = "";
+    batch.keys.forEach((key) => runtime.pendingKeys.set(key, jobId));
+    refreshTrackCardHeader(trackId);
+    setStatus(`${TRACK_META[trackId].label} 正在翻译 ${batch.texts.length} 条字幕`);
+
+    try {
+      const translations = await translateBatch(trackId, batch.texts);
+      if (subtitleToken !== state.sourceToken || runtime.sessionToken !== runtimeToken || runtime.activeJobId !== jobId) {
         return;
       }
 
       const now = Date.now();
-
-      batch.forEach((text, index) => {
+      batch.texts.forEach((text, index) => {
         const translated = normalizeTranslation(translations[index] || "");
         if (!translated) {
           return;
         }
 
-        state.cache[buildCacheKey(text)] = {
+        state.cache[buildCacheKeyFromNormalizedText(trackId, text)] = {
           value: translated,
           updatedAt: now
         };
       });
 
-      translatedCount += batch.length;
       pruneCache();
       saveCache();
       renderActiveCue();
-      await sleep(120);
-    }
-
-    setStatus(`Ready (${state.cues.length} cues)`);
-  }
-
-  function buildBatches(texts, maxChars) {
-    const batches = [];
-    let current = [];
-    let currentSize = 0;
-
-    for (const text of texts) {
-      const size = text.length + 24;
-
-      if (current.length && currentSize + size > maxChars) {
-        batches.push(current);
-        current = [];
-        currentSize = 0;
+      setStatus(`${TRACK_META[trackId].label} 已更新至 ${formatPlaybackTime(batch.anchorTime)}`);
+    } catch (error) {
+      if (subtitleToken !== state.sourceToken || runtime.sessionToken !== runtimeToken || runtime.activeJobId !== jobId) {
+        return;
       }
 
-      current.push(text);
-      currentSize += size;
-    }
+      runtime.lastError = error.message;
+      runtime.nextAttemptAt = Date.now() + TRANSLATION_FAILURE_BACKOFF_MS;
+      setStatus(`${TRACK_META[trackId].label} 翻译失败：${error.message}`);
+      console.error(`[TB] ${trackId} translation failed`, error);
+    } finally {
+      batch.keys.forEach((key) => {
+        if (runtime.pendingKeys.get(key) === jobId) {
+          runtime.pendingKeys.delete(key);
+        }
+      });
 
-    if (current.length) {
-      batches.push(current);
-    }
+      if (runtime.activeJobId === jobId) {
+        runtime.inFlight = false;
+        runtime.activeJobId = 0;
+        runtime.nextAttemptAt = Math.max(runtime.nextAttemptAt, Date.now() + TRANSLATION_BATCH_COOLDOWN_MS);
+      }
 
-    return batches;
+      refreshTrackCardHeader(trackId);
+    }
   }
 
-  async function translateBatch(texts) {
-    if (state.settings.engine === "google-free") {
+  function translateBatch(trackId, texts) {
+    if (trackId === "google") {
       return translateWithGoogle(texts);
     }
 
-    if (state.settings.engine === "openai-compatible") {
-      return translateWithOpenAI(texts);
+    if (isModelTrack(trackId)) {
+      return translateWithOpenAI(trackId, texts);
     }
 
-    throw new Error(`Unsupported engine: ${state.settings.engine}`);
+    throw new Error(`Unsupported track: ${trackId}`);
   }
 
   async function translateWithGoogle(texts) {
@@ -1471,7 +1783,7 @@
     const body = new URLSearchParams();
     body.set("client", "gtx");
     body.set("sl", state.settings.sourceLang);
-    body.set("tl", state.settings.targetLang);
+    body.set("tl", TARGET_LANG);
     body.set("dt", "t");
     body.set("dj", "1");
     body.set("q", text);
@@ -1493,15 +1805,40 @@
       return payload[0].map((item) => Array.isArray(item) ? (item[0] || "") : "").join("");
     }
 
-    throw new Error("Unexpected translation response");
+    throw new Error("Google 返回结果格式异常");
   }
 
-  async function translateWithOpenAI(texts) {
+  async function translateWithOpenAI(trackId, texts) {
+    if (!texts.length) {
+      return [];
+    }
+
+    if (texts.length === 1) {
+      return [await translateSingleTextWithOpenAI(trackId, texts[0])];
+    }
+
+    try {
+      return await translateBatchWithOpenAI(trackId, texts);
+    } catch (error) {
+      if (!shouldFallbackOpenAIBatch(error)) {
+        throw error;
+      }
+
+      console.warn("[TB] OpenAI batch translation fell back to serial mode", {
+        trackId,
+        batchSize: texts.length,
+        error: error?.message || String(error)
+      });
+
+      return translateWithOpenAISerial(trackId, texts);
+    }
+  }
+
+  async function translateWithOpenAISerial(trackId, texts) {
     const translations = [];
 
     for (const text of texts) {
-      translations.push(await translateSingleTextWithOpenAI(text));
-
+      translations.push(await translateSingleTextWithOpenAI(trackId, text));
       if (texts.length > 1) {
         await sleep(80);
       }
@@ -1510,8 +1847,25 @@
     return translations;
   }
 
-  async function translateSingleTextWithOpenAI(text) {
-    const requestConfig = buildOpenAITranslationRequest(text);
+  async function translateBatchWithOpenAI(trackId, texts) {
+    const requestConfig = buildOpenAITranslationRequest(trackId, buildOpenAIBatchUserMessage(texts));
+    const response = await requestRaw(requestConfig.url, {
+      method: "POST",
+      headers: requestConfig.headers,
+      data: requestConfig.data,
+      timeout: requestConfig.timeout
+    });
+
+    return parseOpenAIBatchTranslationResponse(response.responseText, texts.length);
+  }
+
+  function shouldFallbackOpenAIBatch(error) {
+    const message = error?.message || "";
+    return message.startsWith("OpenAI batch response");
+  }
+
+  async function translateSingleTextWithOpenAI(trackId, text) {
+    const requestConfig = buildOpenAITranslationRequest(trackId, buildOpenAIUserMessage(text));
     const response = await requestRaw(requestConfig.url, {
       method: "POST",
       headers: requestConfig.headers,
@@ -1522,68 +1876,73 @@
     return parseOpenAITranslationResponse(response.responseText);
   }
 
-  function requestText(url) {
-    return requestRaw(url, { method: "GET" }).then((response) => response.responseText);
-  }
-
-  function requestRaw(url, options) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: options.method || "GET",
-        url,
-        headers: options.headers || {},
-        data: options.data || null,
-        timeout: options.timeout || 20000,
-        onload: (response) => {
-          if (response.status >= 200 && response.status < 400) {
-            resolve(response);
-            return;
-          }
-          reject(new Error(`HTTP ${response.status}`));
-        },
-        onerror: () => reject(new Error("Network error")),
-        ontimeout: () => reject(new Error("Request timed out"))
-      });
-    });
-  }
-
-  function buildOpenAITranslationRequest(text) {
-    const configError = getOpenAIConfigError();
+  function buildOpenAITranslationRequest(trackId, userMessage) {
+    const configError = getTrackOpenAIConfigError(trackId);
     if (configError) {
       throw new Error(configError);
     }
 
+    const track = state.settings.tracks[trackId];
     return {
-      url: state.settings.openaiApiUrl.trim(),
+      url: track.apiUrl.trim(),
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${state.settings.openaiApiKey.trim()}`
+        Authorization: `Bearer ${track.apiKey.trim()}`
       },
       data: JSON.stringify({
-        model: state.settings.openaiModel.trim(),
-        temperature: clamp(state.settings.openaiTemperature, 0, 2),
+        model: track.model.trim(),
+        temperature: clamp(track.temperature, 0, 2),
         messages: [
           {
             role: "system",
-            content: state.settings.openaiSystemPrompt.trim() || DEFAULT_SETTINGS.openaiSystemPrompt
+            content: buildOpenAISystemMessage(trackId)
           },
           {
             role: "user",
-            content: buildOpenAIUserMessage(text)
+            content: userMessage
           }
         ]
       }),
-      timeout: clamp(state.settings.openaiTimeoutMs, 5000, 120000)
+      timeout: clamp(track.timeoutMs, 5000, 120000)
     };
+  }
+
+  function buildOpenAISystemMessage(trackId) {
+    const track = state.settings.tracks[trackId];
+    const basePrompt = track.systemPrompt.trim() || createDefaultModelConfig().systemPrompt;
+    return [
+      basePrompt,
+      "Follow the user's requested output format exactly."
+    ].join("\n\n");
   }
 
   function buildOpenAIUserMessage(text) {
     return [
       "Translate the following subtitle text.",
       `Source language: ${state.settings.sourceLang}`,
-      `Target language: ${state.settings.targetLang}`,
+      `Target language: ${TARGET_LANG}`,
       "",
       text
+    ].join("\n");
+  }
+
+  function buildOpenAIBatchUserMessage(texts) {
+    return [
+      "Translate each subtitle item independently.",
+      `Source language: ${state.settings.sourceLang}`,
+      `Target language: ${TARGET_LANG}`,
+      `Return only a JSON array of translated strings with exactly ${texts.length} items.`,
+      "Rules:",
+      "- Keep the same item order.",
+      "- Do not merge, split, or skip items.",
+      "- Preserve meaningful line breaks within each item.",
+      "- Do not include markdown, comments, or code fences.",
+      "",
+      "Subtitle items JSON:",
+      JSON.stringify(texts.map((text, index) => ({
+        index: index + 1,
+        text
+      })), null, 2)
     ].join("\n");
   }
 
@@ -1592,7 +1951,7 @@
     try {
       payload = JSON.parse(responseText);
     } catch (error) {
-      throw new Error(`OpenAI response is not valid JSON: ${error.message}`);
+      throw new Error(`OpenAI 响应不是合法 JSON：${error.message}`);
     }
 
     if (payload?.error?.message) {
@@ -1602,10 +1961,136 @@
     const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
     const text = readTextLikeValue(choice?.message?.content ?? choice?.text ?? "");
     if (!text.trim()) {
-      throw new Error("OpenAI translation response is empty");
+      throw new Error("OpenAI 翻译结果为空");
     }
 
     return text.trim();
+  }
+
+  function parseOpenAIBatchTranslationResponse(responseText, expectedCount) {
+    const text = parseOpenAITranslationResponse(responseText);
+    const payload = parseJsonValueFromText(text, "OpenAI batch response");
+
+    if (!Array.isArray(payload)) {
+      throw new Error("OpenAI batch response is not a JSON array");
+    }
+
+    if (payload.length !== expectedCount) {
+      throw new Error(`OpenAI batch response size mismatch: expected ${expectedCount}, got ${payload.length}`);
+    }
+
+    return payload.map((item, index) => {
+      const translated = readBatchTranslationItem(item).trim();
+      if (!translated) {
+        throw new Error(`OpenAI batch response item ${index + 1} is empty`);
+      }
+      return translated;
+    });
+  }
+
+  function parseJsonValueFromText(text, label) {
+    const normalized = stripMarkdownCodeFence(text.trim());
+    const directCandidates = [text.trim(), normalized].filter(Boolean);
+
+    for (const candidate of directCandidates) {
+      try {
+        return JSON.parse(candidate);
+      } catch (error) {
+        // Fall through.
+      }
+    }
+
+    const extracted = extractFirstJsonArray(normalized);
+    if (!extracted) {
+      throw new Error(`${label} is not valid JSON`);
+    }
+
+    try {
+      return JSON.parse(extracted);
+    } catch (error) {
+      throw new Error(`${label} is not valid JSON: ${error.message}`);
+    }
+  }
+
+  function stripMarkdownCodeFence(text) {
+    const match = text.match(/^```(?:[\w-]+)?\s*([\s\S]*?)\s*```$/);
+    return match ? match[1].trim() : text;
+  }
+
+  function extractFirstJsonArray(text) {
+    const start = text.indexOf("[");
+    if (start === -1) {
+      return "";
+    }
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (inString && char === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (char === "\"") {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) {
+        continue;
+      }
+
+      if (char === "[") {
+        depth += 1;
+        continue;
+      }
+
+      if (char !== "]") {
+        continue;
+      }
+
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+
+    return "";
+  }
+
+  function readBatchTranslationItem(value) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      if ("translation" in value) {
+        return readTextLikeValue(value.translation);
+      }
+
+      if ("translated" in value) {
+        return readTextLikeValue(value.translated);
+      }
+
+      if ("translatedText" in value) {
+        return readTextLikeValue(value.translatedText);
+      }
+
+      if ("text" in value) {
+        return readTextLikeValue(value.text);
+      }
+
+      if ("value" in value) {
+        return readTextLikeValue(value.value);
+      }
+    }
+
+    return readTextLikeValue(value);
   }
 
   function readTextLikeValue(value) {
@@ -1632,6 +2117,31 @@
     }
 
     return JSON.stringify(value);
+  }
+
+  function requestText(url) {
+    return requestRaw(url, { method: "GET" }).then((response) => response.responseText);
+  }
+
+  function requestRaw(url, options) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: options.method || "GET",
+        url,
+        headers: options.headers || {},
+        data: options.data || null,
+        timeout: options.timeout || 20000,
+        onload: (response) => {
+          if (response.status >= 200 && response.status < 400) {
+            resolve(response);
+            return;
+          }
+          reject(new Error(`HTTP ${response.status}`));
+        },
+        onerror: () => reject(new Error("Network error")),
+        ontimeout: () => reject(new Error("Request timed out"))
+      });
+    });
   }
 
   function parseSubtitleText(rawText, urlHint) {
@@ -1691,7 +2201,7 @@
   }
 
   function parseCueBlock(lines) {
-    let timeLineIndex = lines.findIndex((line) => line.includes("-->"));
+    const timeLineIndex = lines.findIndex((line) => line.includes("-->"));
     if (timeLineIndex === -1) {
       return null;
     }
@@ -1756,12 +2266,31 @@
       .trim();
   }
 
+  function resetAllTrackTranslationRuntimes() {
+    TRANSLATION_TRACK_IDS.forEach((trackId) => resetTrackTranslationRuntime(trackId));
+  }
+
+  function resetTrackTranslationRuntime(trackId) {
+    const runtime = state.trackRuntimes[trackId];
+    if (!runtime) {
+      return;
+    }
+
+    runtime.inFlight = false;
+    runtime.activeJobId = 0;
+    runtime.pendingKeys.clear();
+    runtime.nextAttemptAt = 0;
+    runtime.lastError = "";
+    runtime.sessionToken += 1;
+    refreshTrackCardHeader(trackId);
+  }
+
   function shouldTranslate(text) {
     return /[\p{L}\p{N}]/u.test(text);
   }
 
-  function getCachedTranslation(text) {
-    const entry = state.cache[buildCacheKey(text)];
+  function getCachedTranslation(trackId, text) {
+    const entry = state.cache[buildCacheKey(trackId, text)];
     if (!entry) {
       return "";
     }
@@ -1770,194 +2299,48 @@
     return entry.value;
   }
 
-  function buildCacheKey(text) {
-    return `${getTranslationProfileCacheKey()}::${state.settings.sourceLang}::${state.settings.targetLang}::${normalizeCueTextForTranslation(text)}`;
+  function hasCachedTranslationByKey(cacheKey) {
+    return Boolean(state.cache[cacheKey]?.value);
   }
 
-  function normalizeTranslation(text) {
-    return text
-      .replace(/\r/g, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+  function buildCacheKey(trackId, text) {
+    return buildCacheKeyFromNormalizedText(trackId, normalizeCueTextForTranslation(text));
   }
 
-  function normalizeCueTextForTranslation(text) {
-    if (!text) {
-      return text;
+  function buildCacheKeyFromNormalizedText(trackId, text) {
+    return `${getTranslationProfileCacheKey(trackId)}::${state.settings.sourceLang}::${TARGET_LANG}::${text}`;
+  }
+
+  function getTranslationProfileCacheKey(trackId) {
+    if (trackId === "google") {
+      return "google-free";
     }
 
-    return text
-      .split(/\n{2,}/)
-      .map((block) => normalizeCueBlockLines(block))
-      .join("\n\n")
-      .replace(/[ \t]+\n/g, "\n")
-      .trim();
-  }
-
-  function promptManualUrl() {
-    const initialValue = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl || state.settings.manualSubtitleUrl || "";
-    const nextUrl = window.prompt("Subtitle URL", initialValue);
-    if (nextUrl === null) {
-      return;
-    }
-
-    const trimmed = nextUrl.trim();
-    state.settings.manualSubtitleUrl = trimmed;
-    saveSettings();
-    refreshActionButtons();
-
-    if (!trimmed) {
-      setStatus("Manual subtitle URL cleared");
-      return;
-    }
-
-    loadSubtitleFromUrl(trimmed, "manual");
-  }
-
-  function promptTargetLanguage() {
-    const nextValue = window.prompt("Target language", state.settings.targetLang);
-    if (nextValue === null) {
-      return;
-    }
-
-    const trimmed = nextValue.trim();
-    if (!trimmed || trimmed === state.settings.targetLang) {
-      return;
-    }
-
-    state.settings.targetLang = trimmed;
-    refreshActionButtons();
-    applyTranslationSettingChange(`Target language set to ${trimmed}`);
-  }
-
-  function toggleOriginal() {
-    state.settings.showOriginal = !state.settings.showOriginal;
-    saveSettings();
-    refreshActionButtons();
-    state.cueKey = "";
-    renderActiveCue();
-    setStatus(state.settings.showOriginal ? "Original line on" : "Original line off");
-  }
-
-  function toggleTranslation() {
-    state.settings.showTranslation = !state.settings.showTranslation;
-    saveSettings();
-    refreshActionButtons();
-    state.cueKey = "";
-    renderActiveCue();
-    setStatus(state.settings.showTranslation ? "Translation line on" : "Translation line off");
-  }
-
-  function retryLastSubtitle() {
-    const url = state.currentSubtitleUrl || state.lastDetectedSubtitleUrl || state.settings.manualSubtitleUrl;
-    if (!url) {
-      setStatus("No subtitle URL detected yet");
-      return;
-    }
-
-    loadSubtitleFromUrl(url, "retry");
-  }
-
-  function applyTranslationSettingChange(message) {
-    saveSettings();
-    state.cueKey = "";
-    renderActiveCue();
-    setStatus(message);
-
-    if (!state.cues.length) {
-      return;
-    }
-
-    const token = ++state.sourceToken;
-    translateMissingCues(token).catch((error) => {
-      if (token !== state.sourceToken) {
-        return;
-      }
-
-      setStatus(`Translation failed: ${error.message}`);
-    });
-  }
-
-  function exportBilingualSrt() {
-    if (!state.cues.length) {
-      setStatus("No subtitles loaded");
-      return;
-    }
-
-    const lines = [];
-    state.cues.forEach((cue, index) => {
-      const translated = getCachedTranslation(cue.text);
-      const body = translated ? `${cue.text}\n${translated}` : cue.text;
-      lines.push(String(index + 1));
-      lines.push(`${formatSrtTime(cue.start)} --> ${formatSrtTime(cue.end)}`);
-      lines.push(body);
-      lines.push("");
+    const track = state.settings.tracks[trackId];
+    const fingerprint = JSON.stringify({
+      trackId,
+      apiUrl: track.apiUrl,
+      model: track.model,
+      systemPrompt: track.systemPrompt,
+      temperature: track.temperature,
+      timeoutMs: track.timeoutMs
     });
 
-    const blob = new Blob([lines.join("\n")], {
-      type: "application/x-subrip;charset=utf-8"
-    });
-
-    const link = document.createElement("a");
-    const suffix = state.settings.targetLang.replace(/[^a-z0-9_-]/gi, "_");
-    link.href = URL.createObjectURL(blob);
-    link.download = `tubi-bilingual-${suffix}.srt`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-
-    window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-    setStatus("Bilingual SRT exported");
+    return `openai-compatible:${trackId}:${hashString(fingerprint)}`;
   }
 
-  function getTranslationProfileCacheKey() {
-    if (state.settings.engine === "openai-compatible") {
-      const fingerprint = JSON.stringify({
-        url: state.settings.openaiApiUrl,
-        model: state.settings.openaiModel,
-        systemPrompt: state.settings.openaiSystemPrompt,
-        temperature: state.settings.openaiTemperature
+  function pruneCache() {
+    const keys = Object.keys(state.cache);
+    if (keys.length <= MAX_CACHE_ENTRIES) {
+      return;
+    }
+
+    keys
+      .sort((left, right) => (state.cache[left].updatedAt || 0) - (state.cache[right].updatedAt || 0))
+      .slice(0, keys.length - MAX_CACHE_ENTRIES)
+      .forEach((key) => {
+        delete state.cache[key];
       });
-
-      return `openai-compatible:${hashString(fingerprint)}`;
-    }
-
-    return state.settings.engine;
-  }
-
-  function formatSrtTime(seconds) {
-    const totalMs = Math.max(0, Math.round(seconds * 1000));
-    const hours = Math.floor(totalMs / 3600000);
-    const minutes = Math.floor((totalMs % 3600000) / 60000);
-    const secs = Math.floor((totalMs % 60000) / 1000);
-    const ms = totalMs % 1000;
-    return [
-      String(hours).padStart(2, "0"),
-      String(minutes).padStart(2, "0"),
-      String(secs).padStart(2, "0")
-    ].join(":") + `,${String(ms).padStart(3, "0")}`;
-  }
-
-  function registerMenuCommands() {
-    GM_registerMenuCommand("Open translation engine panel", toggleEnginePanel);
-    GM_registerMenuCommand("Switch to Google Translate", () => applyEngineSetting("engine", "google-free", false, true));
-    GM_registerMenuCommand("Switch to OpenAI-compatible model", () => applyEngineSetting("engine", "openai-compatible", false, true));
-    GM_registerMenuCommand("Test OpenAI-compatible model API", testOpenAITranslation);
-    GM_registerMenuCommand(`Set target language (${state.settings.targetLang})`, promptTargetLanguage);
-    GM_registerMenuCommand("Set manual subtitle URL", promptManualUrl);
-    GM_registerMenuCommand("Reload last detected subtitle URL", retryLastSubtitle);
-    GM_registerMenuCommand("Toggle original subtitle line", toggleOriginal);
-    GM_registerMenuCommand("Toggle translated subtitle line", toggleTranslation);
-    GM_registerMenuCommand("Show or hide subtitle tools panel", togglePanelCollapsed);
-    GM_registerMenuCommand("Open subtitle style panel", toggleStylePanel);
-    GM_registerMenuCommand("Reset subtitle style settings", resetStyleSettings);
-    GM_registerMenuCommand("Clear translation cache", () => {
-      state.cache = {};
-      saveCache();
-      state.cueKey = "";
-      renderActiveCue();
-      setStatus("Translation cache cleared");
-    });
   }
 
   function syncNativeCaptionVisibility() {
@@ -1982,426 +2365,8 @@
     state.statusText = message;
     if (state.statusNode) {
       state.statusNode.textContent = message;
+      state.statusNode.title = message;
     }
-  }
-
-  function normalizeUrl(url) {
-    try {
-      return new URL(url, location.href).toString();
-    } catch (error) {
-      return "";
-    }
-  }
-
-  function pruneCache() {
-    const keys = Object.keys(state.cache);
-    if (keys.length <= MAX_CACHE_ENTRIES) {
-      return;
-    }
-
-    keys
-      .sort((left, right) => (state.cache[left].updatedAt || 0) - (state.cache[right].updatedAt || 0))
-      .slice(0, keys.length - MAX_CACHE_ENTRIES)
-      .forEach((key) => {
-        delete state.cache[key];
-      });
-  }
-
-  function loadSettings() {
-    const value = GM_getValue(SETTINGS_KEY, {});
-    const raw = (value && typeof value === "object") ? value : {};
-    const merged = Object.assign({}, DEFAULT_SETTINGS, raw);
-    merged.engine = normalizeEngine(merged.engine);
-    merged.openaiApiUrl = String(raw.openaiApiUrl ?? raw.customTranslateUrl ?? DEFAULT_SETTINGS.openaiApiUrl).trim() || DEFAULT_SETTINGS.openaiApiUrl;
-    merged.openaiApiKey = String(raw.openaiApiKey ?? DEFAULT_SETTINGS.openaiApiKey).trim();
-    merged.openaiModel = String(raw.openaiModel ?? DEFAULT_SETTINGS.openaiModel).trim();
-    merged.openaiSystemPrompt = String(raw.openaiSystemPrompt ?? DEFAULT_SETTINGS.openaiSystemPrompt);
-    merged.openaiTemperature = clamp(raw.openaiTemperature ?? DEFAULT_SETTINGS.openaiTemperature, 0, 2);
-    merged.openaiTimeoutMs = clamp(raw.openaiTimeoutMs ?? raw.customTranslateTimeoutMs ?? DEFAULT_SETTINGS.openaiTimeoutMs, 5000, 120000);
-    merged.openaiTestText = String(raw.openaiTestText ?? DEFAULT_SETTINGS.openaiTestText);
-    merged.stylePanelOpen = typeof raw.stylePanelOpen === "boolean" ? raw.stylePanelOpen : Boolean(raw.panelOpen);
-    merged.enginePanelOpen = Boolean(raw.enginePanelOpen);
-
-    if (merged.enginePanelOpen) {
-      merged.stylePanelOpen = false;
-    }
-
-    return merged;
-  }
-
-  function saveSettings() {
-    if (state.settingsSaveId) {
-      window.clearTimeout(state.settingsSaveId);
-      state.settingsSaveId = 0;
-    }
-    GM_setValue(SETTINGS_KEY, state.settings);
-  }
-
-  function scheduleSettingsSave() {
-    if (state.settingsSaveId) {
-      window.clearTimeout(state.settingsSaveId);
-    }
-
-    state.settingsSaveId = window.setTimeout(() => {
-      state.settingsSaveId = 0;
-      GM_setValue(SETTINGS_KEY, state.settings);
-    }, 120);
-  }
-
-  function loadCache() {
-    const value = GM_getValue(CACHE_KEY, {});
-    return (value && typeof value === "object") ? value : {};
-  }
-
-  function saveCache() {
-    GM_setValue(CACHE_KEY, state.cache);
-  }
-
-  function getEngineLabel(engine) {
-    if (engine === "openai-compatible") {
-      return "OpenAI Compatible";
-    }
-
-    return "Google Free";
-  }
-
-  function normalizeEngine(value) {
-    return parseEngineValue(value) || DEFAULT_SETTINGS.engine;
-  }
-
-  function parseEngineValue(value) {
-    const normalized = String(value || "").trim().toLowerCase();
-    if (!normalized) {
-      return "";
-    }
-
-    if (normalized === "google" || normalized === "google-free" || normalized === "google_free") {
-      return "google-free";
-    }
-
-    if (normalized === "openai" || normalized === "openai-compatible" || normalized === "openai_compatible" || normalized === "custom" || normalized === "custom-json" || normalized === "custom_json") {
-      return "openai-compatible";
-    }
-
-    return "";
-  }
-
-  function normalizeEngineSettingValue(key, value) {
-    if (key === "engine") {
-      return normalizeEngine(value);
-    }
-
-    if (key === "openaiApiUrl" || key === "openaiApiKey" || key === "openaiModel") {
-      return String(value || "").trim();
-    }
-
-    if (key === "openaiSystemPrompt") {
-      return String(value || "");
-    }
-
-    if (key === "openaiTestText") {
-      return String(value || "");
-    }
-
-    if (key === "openaiTemperature") {
-      return clamp(value, 0, 2);
-    }
-
-    if (key === "openaiTimeoutMs") {
-      return clamp(value, 5000, 120000);
-    }
-
-    return value;
-  }
-
-  function getOpenAIConfigError() {
-    if (state.settings.engine !== "openai-compatible") {
-      return "";
-    }
-
-    if (!state.settings.openaiApiUrl.trim()) {
-      return "OpenAI API URL is required";
-    }
-
-    if (!state.settings.openaiApiKey.trim()) {
-      return "OpenAI API key is required";
-    }
-
-    if (!state.settings.openaiModel.trim()) {
-      return "OpenAI model is required";
-    }
-
-    return "";
-  }
-
-  function injectStyles() {
-    const style = document.createElement("style");
-    style.textContent = `
-      .tb-root {
-        position: absolute;
-        display: block;
-        pointer-events: none;
-        z-index: 2147483647;
-      }
-
-      .tb-subtitle-box {
-        position: absolute;
-        inset: 0;
-        display: none;
-        flex-direction: column;
-        align-items: center;
-        justify-content: flex-end;
-        gap: 0.35em;
-        padding-left: 5%;
-        padding-right: 5%;
-        box-sizing: border-box;
-        text-align: center;
-        font-family: Arial, sans-serif;
-        line-height: 1.25;
-      }
-
-      .tb-line {
-        display: inline-block;
-        width: fit-content;
-        max-width: 88%;
-        padding: 0.18em 0.45em;
-        border-radius: 0.4em;
-        background: rgba(0, 0, 0, 0.58);
-        color: #ffffff;
-        white-space: pre-wrap;
-        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
-        box-decoration-break: clone;
-      }
-
-      .tb-translation {
-        color: #ffe082;
-      }
-
-      .tb-panel {
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        width: min(260px, calc(100% - 24px));
-        padding: 10px;
-        border-radius: 10px;
-        background: rgba(0, 0, 0, 0.72);
-        color: #f5f5f5;
-        font: 12px/1.35 Arial, sans-serif;
-        pointer-events: auto;
-        box-sizing: border-box;
-      }
-
-      .tb-launcher {
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        min-width: 36px;
-        height: 36px;
-        border: 0;
-        border-radius: 999px;
-        padding: 0 10px;
-        background: rgba(0, 0, 0, 0.76);
-        color: #ffffff;
-        font: 700 12px/1 Arial, sans-serif;
-        letter-spacing: 0.06em;
-        cursor: pointer;
-        pointer-events: auto;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
-      }
-
-      .tb-launcher:hover {
-        background: rgba(0, 0, 0, 0.88);
-      }
-
-      .tb-hidden {
-        display: none !important;
-      }
-
-      .tb-hide-native-captions [data-id="captionsComponent"] {
-        display: none !important;
-      }
-
-      .tb-panel-expanded {
-        width: min(360px, calc(100% - 24px));
-      }
-
-      .tb-status {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .tb-actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-      }
-
-      .tb-button {
-        border: 0;
-        padding: 5px 8px;
-        border-radius: 6px;
-        background: rgba(255, 255, 255, 0.14);
-        color: #ffffff;
-        font: inherit;
-        cursor: pointer;
-      }
-
-      .tb-button:hover {
-        background: rgba(255, 255, 255, 0.25);
-      }
-
-      .tb-button:disabled {
-        opacity: 0.55;
-        cursor: default;
-      }
-
-      .tb-button-secondary {
-        background: rgba(255, 255, 255, 0.08);
-      }
-
-      .tb-config-panel {
-        display: grid;
-        gap: 10px;
-        margin-top: 2px;
-        padding-top: 2px;
-      }
-
-      .tb-section {
-        display: grid;
-        gap: 6px;
-        padding: 8px;
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.06);
-      }
-
-      .tb-section-title {
-        font-weight: 700;
-        letter-spacing: 0.02em;
-      }
-
-      .tb-control {
-        display: grid;
-        grid-template-columns: 62px 1fr auto;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .tb-control-label {
-        color: rgba(255, 255, 255, 0.86);
-      }
-
-      .tb-control-input {
-        min-width: 0;
-      }
-
-      .tb-range,
-      .tb-select,
-      .tb-color,
-      .tb-text-input,
-      .tb-textarea {
-        width: 100%;
-        box-sizing: border-box;
-      }
-
-      .tb-select,
-      .tb-text-input,
-      .tb-textarea {
-        border: 0;
-        padding: 5px 6px;
-        border-radius: 6px;
-        background: rgba(255, 255, 255, 0.12);
-        color: #ffffff;
-        font: inherit;
-      }
-
-      .tb-textarea {
-        min-height: 84px;
-        resize: vertical;
-      }
-
-      .tb-hint {
-        color: rgba(255, 255, 255, 0.66);
-        font-size: 11px;
-        line-height: 1.4;
-      }
-
-      .tb-color {
-        height: 28px;
-        border: 0;
-        padding: 0;
-        background: transparent;
-        cursor: pointer;
-      }
-
-      .tb-control-value {
-        min-width: 54px;
-        text-align: right;
-        color: rgba(255, 255, 255, 0.72);
-        font-variant-numeric: tabular-nums;
-      }
-
-      .tb-style-footer {
-        display: flex;
-        justify-content: flex-end;
-      }
-
-      .tb-inline-actions {
-        display: flex;
-        gap: 6px;
-        justify-content: flex-end;
-      }
-    `;
-
-    if (document.documentElement) {
-      document.documentElement.appendChild(style);
-      return;
-    }
-
-    document.addEventListener("DOMContentLoaded", () => {
-      document.documentElement?.appendChild(style);
-    }, { once: true });
-  }
-
-  function escapeRegExp(value) {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  function applySubtitleStyles() {
-    if (!state.subtitleBox || !state.originalNode || !state.translationNode) {
-      return;
-    }
-
-    state.subtitleBox.style.gap = `${state.settings.lineGapEm}em`;
-    state.subtitleBox.style.textAlign = state.settings.textAlign;
-    state.subtitleBox.style.alignItems = mapTextAlignToFlexAlignment(state.settings.textAlign);
-
-    applyLineStyles(state.originalNode, {
-      widthPercent: state.settings.maxWidthPercent,
-      color: state.settings.originalColor,
-      bgColor: state.settings.originalBgColor,
-      bgOpacity: state.settings.originalBgOpacity,
-      fontWeight: state.settings.originalFontWeight
-    });
-
-    applyLineStyles(state.translationNode, {
-      widthPercent: state.settings.maxWidthPercent,
-      color: state.settings.translationColor,
-      bgColor: state.settings.translationBgColor,
-      bgOpacity: state.settings.translationBgOpacity,
-      fontWeight: state.settings.translationFontWeight
-    });
-  }
-
-  function applyLineStyles(node, options) {
-    node.style.width = "fit-content";
-    node.style.maxWidth = `${options.widthPercent}%`;
-    node.style.color = options.color;
-    node.style.background = hexToRgba(options.bgColor, options.bgOpacity);
-    node.style.fontWeight = String(options.fontWeight);
   }
 
   function mapTextAlignToFlexAlignment(textAlign) {
@@ -2419,7 +2384,7 @@
   function formatOriginalTextForDisplay(text) {
     const normalizedText = normalizeCueLineBreaksForDisplay(text);
 
-    if (state.settings.originalCaseMode !== "smart") {
+    if (state.settings.layout.originalCaseMode !== "smart") {
       return normalizedText;
     }
 
@@ -2434,7 +2399,7 @@
   }
 
   function normalizeCueLineBreaksForDisplay(text) {
-    if (!text || state.settings.lineBreakMode !== "smart") {
+    if (!text || state.settings.layout.lineBreakMode !== "smart") {
       return text;
     }
 
@@ -2442,6 +2407,19 @@
       .split(/\n{2,}/)
       .map((block) => normalizeCueBlockLines(block))
       .join("\n\n");
+  }
+
+  function normalizeCueTextForTranslation(text) {
+    if (!text) {
+      return text;
+    }
+
+    return text
+      .split(/\n{2,}/)
+      .map((block) => normalizeCueBlockLines(block))
+      .join("\n\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .trim();
   }
 
   function normalizeCueBlockLines(block) {
@@ -2467,11 +2445,7 @@
     }
 
     const dialogueLines = lines.filter((line) => /^\s*[-–—]/.test(line));
-    if (dialogueLines.length >= 2) {
-      return true;
-    }
-
-    return false;
+    return dialogueLines.length >= 2;
   }
 
   function normalizeUppercaseLine(line) {
@@ -2503,10 +2477,7 @@
   function normalizeUppercaseText(text) {
     let normalized = text.toLowerCase();
     normalized = normalized.replace(/\bi(?=(?:['’][a-z]+)?\b)/g, "I");
-    normalized = normalized.replace(/(^|[.!?:]\s+|[\[(]\s*|["“]\s*)([a-z])/g, (match, prefix, char) => {
-      return `${prefix}${char.toUpperCase()}`;
-    });
-
+    normalized = normalized.replace(/(^|[.!?:]\s+|[\[(]\s*|["“]\s*)([a-z])/g, (match, prefix, char) => `${prefix}${char.toUpperCase()}`);
     return normalized;
   }
 
@@ -2522,6 +2493,479 @@
 
     const uppercase = line.match(/[A-Z]/g) || [];
     return uppercase.length / letters.length >= 0.9;
+  }
+
+  function loadSettings() {
+    const rawV2 = GM_getValue(SETTINGS_KEY, null);
+    if (rawV2 && typeof rawV2 === "object" && rawV2.tracks) {
+      return normalizeSettings(rawV2);
+    }
+
+    const rawLegacy = GM_getValue(LEGACY_SETTINGS_KEY, null);
+    if (rawLegacy && typeof rawLegacy === "object") {
+      migratedLegacySettings = true;
+      return migrateLegacySettings(rawLegacy);
+    }
+
+    return createDefaultSettings();
+  }
+
+  function normalizeSettings(raw) {
+    const defaults = createDefaultSettings();
+
+    return {
+      sourceLang: normalizeSourceLang(raw.sourceLang ?? defaults.sourceLang),
+      hideNativeTracks: typeof raw.hideNativeTracks === "boolean" ? raw.hideNativeTracks : defaults.hideNativeTracks,
+      batchChars: clamp(raw.batchChars ?? defaults.batchChars, 200, 3000),
+      panelCollapsed: typeof raw.panelCollapsed === "boolean" ? raw.panelCollapsed : defaults.panelCollapsed,
+      layoutPanelOpen: typeof raw.layoutPanelOpen === "boolean" ? raw.layoutPanelOpen : defaults.layoutPanelOpen,
+      layout: normalizeLayout(raw.layout, defaults.layout),
+      tracks: {
+        source: normalizeTrack(raw.tracks?.source, defaults.tracks.source, "source"),
+        google: normalizeTrack(raw.tracks?.google, defaults.tracks.google, "google"),
+        model1: normalizeTrack(raw.tracks?.model1, defaults.tracks.model1, "model1"),
+        model2: normalizeTrack(raw.tracks?.model2, defaults.tracks.model2, "model2")
+      }
+    };
+  }
+
+  function migrateLegacySettings(raw) {
+    const defaults = createDefaultSettings();
+    const legacyEngine = parseLegacyEngine(raw.engine);
+    const translationEnabled = raw.showTranslation !== false;
+    const translationStyle = {
+      scale: clamp(raw.translationScale ?? defaults.tracks.google.style.scale, 0.7, 1.8),
+      color: normalizeHexColor(raw.translationColor ?? defaults.tracks.google.style.color, defaults.tracks.google.style.color),
+      bgColor: normalizeHexColor(raw.translationBgColor ?? defaults.tracks.google.style.bgColor, defaults.tracks.google.style.bgColor),
+      bgOpacity: clamp(raw.translationBgOpacity ?? defaults.tracks.google.style.bgOpacity, 0, 1),
+      fontWeight: normalizeFontWeight(raw.translationFontWeight ?? defaults.tracks.google.style.fontWeight)
+    };
+
+    const migrated = createDefaultSettings();
+    migrated.sourceLang = normalizeSourceLang(raw.sourceLang ?? defaults.sourceLang);
+    migrated.hideNativeTracks = typeof raw.hideNativeTracks === "boolean" ? raw.hideNativeTracks : defaults.hideNativeTracks;
+    migrated.batchChars = clamp(raw.batchChars ?? defaults.batchChars, 200, 3000);
+    migrated.panelCollapsed = typeof raw.panelCollapsed === "boolean" ? raw.panelCollapsed : defaults.panelCollapsed;
+    migrated.layoutPanelOpen = true;
+    migrated.layout = normalizeLayout({
+      fontScale: raw.fontScale,
+      bottomOffsetPx: raw.bottomOffsetPx,
+      maxWidthPercent: raw.maxWidthPercent,
+      lineGapEm: raw.lineGapEm,
+      textAlign: raw.textAlign,
+      lineBreakMode: raw.lineBreakMode,
+      originalCaseMode: raw.originalCaseMode
+    }, defaults.layout);
+
+    migrated.tracks.source.enabled = raw.showOriginal !== false;
+    migrated.tracks.source.style = normalizeTrackStyle({
+      scale: raw.originalScale,
+      color: raw.originalColor,
+      bgColor: raw.originalBgColor,
+      bgOpacity: raw.originalBgOpacity,
+      fontWeight: raw.originalFontWeight
+    }, defaults.tracks.source.style);
+
+    migrated.tracks.google.enabled = translationEnabled && legacyEngine !== "openai-compatible";
+    migrated.tracks.google.style = normalizeTrackStyle(translationStyle, defaults.tracks.google.style);
+
+    migrated.tracks.model1.enabled = translationEnabled && legacyEngine === "openai-compatible";
+    migrated.tracks.model1.style = normalizeTrackStyle(translationStyle, defaults.tracks.model1.style);
+    migrated.tracks.model1.apiUrl = String(raw.openaiApiUrl ?? raw.customTranslateUrl ?? defaults.tracks.model1.apiUrl).trim();
+    migrated.tracks.model1.apiKey = String(raw.openaiApiKey ?? defaults.tracks.model1.apiKey).trim();
+    migrated.tracks.model1.model = String(raw.openaiModel ?? defaults.tracks.model1.model).trim();
+    migrated.tracks.model1.systemPrompt = String(raw.openaiSystemPrompt ?? defaults.tracks.model1.systemPrompt);
+    migrated.tracks.model1.temperature = clamp(raw.openaiTemperature ?? defaults.tracks.model1.temperature, 0, 2);
+    migrated.tracks.model1.timeoutMs = clamp(raw.openaiTimeoutMs ?? raw.customTranslateTimeoutMs ?? defaults.tracks.model1.timeoutMs, 5000, 120000);
+    migrated.tracks.model1.testText = String(raw.openaiTestText ?? defaults.tracks.model1.testText);
+
+    migrated.tracks.model2.enabled = false;
+    migrated.tracks.model2.style = normalizeTrackStyle(translationStyle, defaults.tracks.model2.style);
+
+    return migrated;
+  }
+
+  function saveSettings() {
+    if (state.settingsSaveId) {
+      window.clearTimeout(state.settingsSaveId);
+      state.settingsSaveId = 0;
+    }
+
+    GM_setValue(SETTINGS_KEY, state.settings);
+  }
+
+  function scheduleSettingsSave() {
+    if (state.settingsSaveId) {
+      window.clearTimeout(state.settingsSaveId);
+    }
+
+    state.settingsSaveId = window.setTimeout(() => {
+      state.settingsSaveId = 0;
+      GM_setValue(SETTINGS_KEY, state.settings);
+    }, 120);
+  }
+
+  function loadCache() {
+    const value = GM_getValue(CACHE_KEY, {});
+    return (value && typeof value === "object") ? value : {};
+  }
+
+  function saveCache() {
+    GM_setValue(CACHE_KEY, state.cache);
+  }
+
+  function createDefaultSettings() {
+    return {
+      sourceLang: "auto",
+      hideNativeTracks: true,
+      batchChars: 900,
+      panelCollapsed: true,
+      layoutPanelOpen: true,
+      layout: {
+        fontScale: 1,
+        bottomOffsetPx: 82,
+        maxWidthPercent: 88,
+        lineGapEm: 0.35,
+        textAlign: "center",
+        lineBreakMode: "smart",
+        originalCaseMode: "smart"
+      },
+      tracks: {
+        source: {
+          enabled: true,
+          style: createTrackStyle({
+            scale: 1,
+            color: "#FFFFFF",
+            bgColor: "#000000",
+            bgOpacity: 0.58,
+            fontWeight: 700
+          })
+        },
+        google: {
+          enabled: true,
+          style: createTrackStyle({
+            scale: 0.92,
+            color: "#FFE082",
+            bgColor: "#000000",
+            bgOpacity: 0.58,
+            fontWeight: 600
+          })
+        },
+        model1: createModelTrack({
+          enabled: false,
+          style: createTrackStyle({
+            scale: 0.92,
+            color: "#8BD6FF",
+            bgColor: "#00131E",
+            bgOpacity: 0.58,
+            fontWeight: 600
+          })
+        }),
+        model2: createModelTrack({
+          enabled: false,
+          style: createTrackStyle({
+            scale: 0.92,
+            color: "#FFB1CC",
+            bgColor: "#1E0011",
+            bgOpacity: 0.58,
+            fontWeight: 600
+          })
+        })
+      }
+    };
+  }
+
+  function createModelTrack(overrides) {
+    const config = createDefaultModelConfig();
+    return {
+      enabled: Boolean(overrides.enabled),
+      style: normalizeTrackStyle(overrides.style, createTrackStyle({
+        scale: 0.92,
+        color: "#FFE082",
+        bgColor: "#000000",
+        bgOpacity: 0.58,
+        fontWeight: 600
+      })),
+      apiUrl: config.apiUrl,
+      apiKey: config.apiKey,
+      model: config.model,
+      systemPrompt: config.systemPrompt,
+      temperature: config.temperature,
+      timeoutMs: config.timeoutMs,
+      testText: config.testText
+    };
+  }
+
+  function createDefaultModelConfig() {
+    return {
+      apiUrl: "https://api.openai.com/v1/chat/completions",
+      apiKey: "",
+      model: "",
+      systemPrompt: "You are a subtitle translator. Translate the subtitle text faithfully into the target language. Follow the requested output format exactly.",
+      temperature: 0,
+      timeoutMs: 30000,
+      testText: "Hello. This is a subtitle translation test."
+    };
+  }
+
+  function createTrackStyle(values) {
+    return {
+      scale: values.scale,
+      color: values.color,
+      bgColor: values.bgColor,
+      bgOpacity: values.bgOpacity,
+      fontWeight: values.fontWeight
+    };
+  }
+
+  function normalizeLayout(raw, defaults) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    return {
+      fontScale: clamp(source.fontScale ?? defaults.fontScale, 0.7, 1.8),
+      bottomOffsetPx: clamp(source.bottomOffsetPx ?? defaults.bottomOffsetPx, 0, 180),
+      maxWidthPercent: clamp(source.maxWidthPercent ?? defaults.maxWidthPercent, 60, 100),
+      lineGapEm: clamp(source.lineGapEm ?? defaults.lineGapEm, 0, 1.2),
+      textAlign: normalizeTextAlign(source.textAlign ?? defaults.textAlign),
+      lineBreakMode: normalizeLineBreakMode(source.lineBreakMode ?? defaults.lineBreakMode),
+      originalCaseMode: normalizeOriginalCaseMode(source.originalCaseMode ?? defaults.originalCaseMode)
+    };
+  }
+
+  function normalizeTrack(raw, defaults, trackId) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    const normalized = {
+      enabled: typeof source.enabled === "boolean" ? source.enabled : defaults.enabled,
+      style: normalizeTrackStyle(source.style, defaults.style)
+    };
+
+    if (isModelTrack(trackId)) {
+      normalized.apiUrl = String(source.apiUrl ?? defaults.apiUrl).trim();
+      normalized.apiKey = String(source.apiKey ?? defaults.apiKey).trim();
+      normalized.model = String(source.model ?? defaults.model).trim();
+      normalized.systemPrompt = String(source.systemPrompt ?? defaults.systemPrompt);
+      normalized.temperature = clamp(source.temperature ?? defaults.temperature, 0, 2);
+      normalized.timeoutMs = clamp(source.timeoutMs ?? defaults.timeoutMs, 5000, 120000);
+      normalized.testText = String(source.testText ?? defaults.testText);
+    }
+
+    return normalized;
+  }
+
+  function normalizeTrackStyle(raw, defaults) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    return {
+      scale: clamp(source.scale ?? defaults.scale, 0.7, 1.8),
+      color: normalizeHexColor(source.color ?? defaults.color, defaults.color),
+      bgColor: normalizeHexColor(source.bgColor ?? defaults.bgColor, defaults.bgColor),
+      bgOpacity: clamp(source.bgOpacity ?? defaults.bgOpacity, 0, 1),
+      fontWeight: normalizeFontWeight(source.fontWeight ?? defaults.fontWeight)
+    };
+  }
+
+  function normalizeLayoutValue(key, value) {
+    if (key === "fontScale") {
+      return clamp(value, 0.7, 1.8);
+    }
+
+    if (key === "bottomOffsetPx") {
+      return clamp(value, 0, 180);
+    }
+
+    if (key === "maxWidthPercent") {
+      return clamp(value, 60, 100);
+    }
+
+    if (key === "lineGapEm") {
+      return clamp(value, 0, 1.2);
+    }
+
+    if (key === "textAlign") {
+      return normalizeTextAlign(value);
+    }
+
+    if (key === "lineBreakMode") {
+      return normalizeLineBreakMode(value);
+    }
+
+    if (key === "originalCaseMode") {
+      return normalizeOriginalCaseMode(value);
+    }
+
+    return value;
+  }
+
+  function normalizeTrackStyleValue(key, value) {
+    if (key === "scale") {
+      return clamp(value, 0.7, 1.8);
+    }
+
+    if (key === "fontWeight") {
+      return normalizeFontWeight(value);
+    }
+
+    if (key === "color" || key === "bgColor") {
+      return normalizeHexColor(value, "#FFFFFF");
+    }
+
+    if (key === "bgOpacity") {
+      return clamp(value, 0, 1);
+    }
+
+    return value;
+  }
+
+  function normalizeModelSettingValue(key, value) {
+    if (key === "apiUrl" || key === "apiKey" || key === "model") {
+      return String(value || "").trim();
+    }
+
+    if (key === "systemPrompt" || key === "testText") {
+      return String(value || "");
+    }
+
+    if (key === "temperature") {
+      return clamp(value, 0, 2);
+    }
+
+    if (key === "timeoutMs") {
+      return clamp(value, 5000, 120000);
+    }
+
+    return value;
+  }
+
+  function getTrackOpenAIConfigError(trackId) {
+    if (!isModelTrack(trackId)) {
+      return "";
+    }
+
+    const track = state.settings.tracks[trackId];
+    if (!track.apiUrl.trim()) {
+      return "接口 URL 未填写";
+    }
+
+    if (!track.apiKey.trim()) {
+      return "API Key 未填写";
+    }
+
+    if (!track.model.trim()) {
+      return "模型名未填写";
+    }
+
+    return "";
+  }
+
+  function parseLegacyEngine(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "openai" || normalized === "openai-compatible" || normalized === "openai_compatible" || normalized === "custom" || normalized === "custom-json") {
+      return "openai-compatible";
+    }
+
+    return "google-free";
+  }
+
+  function normalizeSourceLang(value) {
+    const normalized = String(value || "").trim();
+    return normalized || "auto";
+  }
+
+  function normalizeTextAlign(value) {
+    if (value === "left" || value === "right") {
+      return value;
+    }
+    return "center";
+  }
+
+  function normalizeLineBreakMode(value) {
+    return value === "raw" ? "raw" : "smart";
+  }
+
+  function normalizeOriginalCaseMode(value) {
+    return value === "raw" ? "raw" : "smart";
+  }
+
+  function normalizeHexColor(value, fallback) {
+    const match = String(value || "").trim().match(/^#?([a-f\d]{6})$/i);
+    if (!match) {
+      return fallback;
+    }
+
+    return `#${match[1].toUpperCase()}`;
+  }
+
+  function normalizeFontWeight(value) {
+    const rounded = Math.round(clamp(value, 400, 900) / 100) * 100;
+    return clamp(rounded, 400, 900);
+  }
+
+  function normalizeTranslation(text) {
+    return text
+      .replace(/\r/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function normalizeUrl(url) {
+    try {
+      return new URL(url, location.href).toString();
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function formatPlaybackTime(seconds) {
+    const totalSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+
+    if (hours > 0) {
+      return [
+        String(hours).padStart(2, "0"),
+        String(minutes).padStart(2, "0"),
+        String(secs).padStart(2, "0")
+      ].join(":");
+    }
+
+    return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+
+  function createTrackNodeMap() {
+    return createTrackTextMap(null);
+  }
+
+  function createTrackBindingMap() {
+    return TRACK_ORDER.reduce((result, trackId) => {
+      result[trackId] = [];
+      return result;
+    }, {});
+  }
+
+  function createTrackRuntimeMap() {
+    return TRACK_ORDER.reduce((result, trackId) => {
+      result[trackId] = {
+        inFlight: false,
+        jobSeq: 0,
+        activeJobId: 0,
+        pendingKeys: new Map(),
+        nextAttemptAt: 0,
+        sessionToken: 0,
+        lastError: "",
+        testPending: false
+      };
+      return result;
+    }, {});
+  }
+
+  function createTrackTextMap(fillValue) {
+    return TRACK_ORDER.reduce((result, trackId) => {
+      result[trackId] = fillValue;
+      return result;
+    }, {});
+  }
+
+  function isModelTrack(trackId) {
+    return trackId === "model1" || trackId === "model2";
   }
 
   function hexToRgba(hex, alpha) {
@@ -2553,6 +2997,10 @@
     return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
   }
 
+  function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
   function hashString(value) {
     let hash = 2166136261;
 
@@ -2566,5 +3014,425 @@
 
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  function injectStyles() {
+    const style = document.createElement("style");
+    style.textContent = `
+      .tb-root {
+        position: absolute;
+        display: block;
+        pointer-events: none;
+        z-index: 2147483647;
+        font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+
+      .tb-subtitle-box {
+        position: absolute;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 0.35em;
+        padding-left: 5%;
+        padding-right: 5%;
+        box-sizing: border-box;
+        text-align: center;
+        line-height: 1.25;
+      }
+
+      .tb-line {
+        display: inline-block;
+        width: fit-content;
+        max-width: 88%;
+        padding: 0.18em 0.45em;
+        border-radius: 0.45em;
+        color: #ffffff;
+        white-space: pre-wrap;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+        box-decoration-break: clone;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+      }
+
+      .tb-panel {
+        --tb-panel-max-height: min(78vh, 760px);
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        width: min(420px, calc(100% - 24px));
+        max-height: var(--tb-panel-max-height);
+        border-radius: 14px;
+        background:
+          linear-gradient(180deg, rgba(20, 28, 36, 0.94), rgba(10, 14, 20, 0.92)),
+          linear-gradient(135deg, rgba(139, 214, 255, 0.12), rgba(255, 158, 196, 0.08));
+        color: #f3f7fb;
+        font: 12px/1.45 "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+        pointer-events: auto;
+        box-sizing: border-box;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
+        backdrop-filter: blur(14px);
+      }
+
+      .tb-panel-scroll {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-height: var(--tb-panel-max-height);
+        overflow-y: auto;
+        padding: 12px;
+        scrollbar-gutter: stable;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(139, 214, 255, 0.42) rgba(255, 255, 255, 0.04);
+      }
+
+      .tb-panel-scroll::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .tb-panel-scroll::-webkit-scrollbar-track {
+        margin: 10px 0;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .tb-panel-scroll::-webkit-scrollbar-thumb {
+        border: 2px solid transparent;
+        border-radius: 999px;
+        background:
+          linear-gradient(180deg, rgba(139, 214, 255, 0.52), rgba(255, 158, 196, 0.42)),
+          rgba(255, 255, 255, 0.16);
+        background-clip: padding-box;
+      }
+
+      .tb-panel-scroll::-webkit-scrollbar-thumb:hover {
+        background:
+          linear-gradient(180deg, rgba(139, 214, 255, 0.68), rgba(255, 158, 196, 0.56)),
+          rgba(255, 255, 255, 0.22);
+        background-clip: padding-box;
+      }
+
+      .tb-panel-header {
+        position: sticky;
+        top: -12px;
+        z-index: 3;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin: -12px -12px 0;
+        padding: 12px 12px 10px;
+        background:
+          linear-gradient(180deg, rgba(20, 28, 36, 0.98), rgba(15, 21, 29, 0.95)),
+          linear-gradient(135deg, rgba(139, 214, 255, 0.1), rgba(255, 158, 196, 0.06));
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(14px);
+      }
+
+      .tb-launcher {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        min-width: 52px;
+        height: 36px;
+        border: 0;
+        border-radius: 999px;
+        padding: 0 14px;
+        background: linear-gradient(135deg, rgba(17, 23, 30, 0.92), rgba(33, 46, 59, 0.92));
+        color: #ffffff;
+        font: 700 12px/1 "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+        letter-spacing: 0.08em;
+        cursor: pointer;
+        pointer-events: auto;
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
+      }
+
+      .tb-launcher:hover {
+        background: linear-gradient(135deg, rgba(23, 31, 40, 0.96), rgba(47, 64, 82, 0.96));
+      }
+
+      .tb-hidden {
+        display: none !important;
+      }
+
+      .tb-hide-native-captions [data-id="captionsComponent"] {
+        display: none !important;
+      }
+
+      .tb-status {
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(243, 247, 251, 0.96);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .tb-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .tb-button {
+        border: 0;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.12);
+        color: #ffffff;
+        font: inherit;
+        cursor: pointer;
+        transition: background 0.16s ease, transform 0.16s ease;
+      }
+
+      .tb-button:hover {
+        background: rgba(255, 255, 255, 0.2);
+        transform: translateY(-1px);
+      }
+
+      .tb-button:disabled {
+        opacity: 0.58;
+        cursor: default;
+        transform: none;
+      }
+
+      .tb-button-mini {
+        padding: 5px 9px;
+        white-space: nowrap;
+      }
+
+      .tb-button-secondary {
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .tb-panel-section {
+        display: grid;
+        gap: 10px;
+        padding: 10px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.05);
+      }
+
+      .tb-panel-section-collapsible {
+        gap: 0;
+      }
+
+      .tb-panel-section-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        cursor: pointer;
+      }
+
+      .tb-panel-section-title-wrap {
+        min-width: 0;
+      }
+
+      .tb-panel-section-meta {
+        margin-top: 2px;
+        color: rgba(243, 247, 251, 0.64);
+      }
+
+      .tb-panel-section-body {
+        display: grid;
+        gap: 10px;
+        padding-top: 10px;
+      }
+
+      .tb-panel-section-open .tb-panel-section-header {
+        padding-bottom: 10px;
+        margin-bottom: 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .tb-section-title {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+      }
+
+      .tb-track-card {
+        display: grid;
+        gap: 10px;
+        padding: 10px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        box-shadow: inset 0 0 0 1px transparent;
+      }
+
+      .tb-track-card-enabled {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tb-track-accent) 26%, transparent);
+      }
+
+      .tb-track-card-open {
+        background: rgba(255, 255, 255, 0.07);
+      }
+
+      .tb-track-card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        cursor: pointer;
+      }
+
+      .tb-track-card-title-wrap {
+        min-width: 0;
+      }
+
+      .tb-track-card-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: var(--tb-track-accent);
+      }
+
+      .tb-track-card-meta {
+        margin-top: 2px;
+        color: rgba(243, 247, 251, 0.64);
+      }
+
+      .tb-track-card-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .tb-track-status {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(243, 247, 251, 0.88);
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .tb-track-card-body {
+        display: grid;
+        gap: 12px;
+      }
+
+      .tb-track-block {
+        display: grid;
+        gap: 8px;
+        padding: 10px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .tb-block-title {
+        font-weight: 700;
+        color: rgba(243, 247, 251, 0.9);
+      }
+
+      .tb-control {
+        display: grid;
+        grid-template-columns: 78px 1fr auto;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tb-control-label {
+        color: rgba(243, 247, 251, 0.84);
+      }
+
+      .tb-control-input {
+        min-width: 0;
+      }
+
+      .tb-range,
+      .tb-select,
+      .tb-color,
+      .tb-text-input,
+      .tb-textarea {
+        width: 100%;
+        box-sizing: border-box;
+      }
+
+      .tb-select,
+      .tb-text-input,
+      .tb-textarea {
+        border: 0;
+        padding: 6px 8px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+        font: inherit;
+      }
+
+      .tb-textarea {
+        min-height: 88px;
+        resize: vertical;
+      }
+
+      .tb-color {
+        height: 30px;
+        border: 0;
+        padding: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .tb-control-value {
+        min-width: 58px;
+        text-align: right;
+        color: rgba(243, 247, 251, 0.7);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tb-hint {
+        color: rgba(243, 247, 251, 0.66);
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .tb-inline-actions {
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      @media (max-width: 720px) {
+        .tb-panel {
+          width: calc(100% - 16px);
+          top: 8px;
+          right: 8px;
+          left: 8px;
+          --tb-panel-max-height: min(72vh, 680px);
+        }
+
+        .tb-launcher {
+          top: 8px;
+          right: 8px;
+        }
+
+        .tb-control {
+          grid-template-columns: 72px 1fr;
+        }
+
+        .tb-control-value {
+          grid-column: 2;
+          justify-self: end;
+        }
+
+        .tb-track-card-header {
+          align-items: flex-start;
+        }
+      }
+    `;
+
+    if (document.documentElement) {
+      document.documentElement.appendChild(style);
+      return;
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      document.documentElement?.appendChild(style);
+    }, { once: true });
   }
 })();

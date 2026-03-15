@@ -1,96 +1,112 @@
-# Tubi Bilingual Subtitles
+# Tubi 多轨字幕助手
 
-Tampermonkey userscript for Tubi that:
+这是一个运行在 Tubi 上的 Tampermonkey userscript，主要功能是：
 
-- detects subtitle requests such as `.srt` or `.vtt`
-- downloads the subtitle file directly
-- translates each cue into a target language
-- renders original and translated lines over the video
-- exports a bilingual `.srt` file
+- 自动捕获 Tubi 播放页发出的 `.srt` / `.vtt` 字幕请求
+- 在播放器上叠加显示固定四轨字幕
+- 支持 `源字幕`、`Google 翻译`、`模型 1`、`模型 2` 同时显示
+- 每条字幕轨都可以独立开关和独立调整样式
+- Google 轨与模型轨只会在启用时按播放进度逐步翻译
 
-## Current MVP behavior
+## 当前行为
 
-- Site: `https://tubitv.com/*`
-- Subtitle source: auto-detected network requests, or a manual subtitle URL
-- Translation engine: built-in Google web endpoint, or an OpenAI-compatible chat completions model
-- Output: original line + translated line in an overlay
-- Native Tubi captions: hidden from the page while keeping subtitle loading enabled
+- 站点范围：`https://tubitv.com/*`
+- 字幕来源：仅使用自动检测到的 Tubi 字幕文件
+- 目标语言：固定为简体中文 `zh-CN`
+- 源语言：内部使用自动识别
+- 原生字幕：脚本会尽量隐藏 Tubi 自带字幕层，避免重复显示
+- 面板交互：仅使用播放器上的 HTML 面板，不再提供 Tampermonkey 菜单项
 
-## Install
+## 安装
 
-1. Install Tampermonkey.
-2. Create a new script.
-3. Paste the contents of `tubi-bilingual-subtitles.user.js`.
-4. Open a Tubi video page and start playback.
+1. 安装 Tampermonkey。
+2. 新建脚本。
+3. 粘贴 [`tubi-bilingual-subtitles.user.js`](./tubi-bilingual-subtitles.user.js) 的内容。
+4. 打开任意 Tubi 视频页并开始播放。
 
-## Controls
+## 面板说明
 
-- `TB`: open the hidden subtitle tools panel
-- `Subtitle URL`: set a subtitle URL manually
-- `Target Language`: change the target language, default `zh-CN`
-- `Engine Settings`: open the translation engine panel and switch between `google-free` and `openai-compatible`
-- `Reload Subtitle`: reload the last detected subtitle URL
-- `Original: On/Off`: toggle the original subtitle line
-- `Translation: On/Off`: toggle the translated line
-- `Style Panel`: open the style panel and adjust subtitle appearance live
-- `Hide Panel`: collapse the tools panel back into the `TB` launcher
-- `Export SRT`: export the current bilingual subtitle file
+播放器右上角会出现 `字幕` 启动按钮。打开后，面板顶部的状态区和动作区会在 `.tb-panel` 内部保持吸顶，滚动长面板时仍可看到状态、重新载入和收起按钮。面板包含三部分：
 
-The same actions are also exposed through the Tampermonkey menu.
-The main GUI is hidden by default each time the page loads.
+### 1. 状态与动作
 
-## Engine panel
+- `重新载入字幕`：重新请求最近检测到的字幕文件
+- `收起面板`：隐藏面板，只保留启动按钮
 
-Click `Engine Settings` to open a dedicated translation settings panel. It persists:
+### 2. 全局布局
 
-- `Mode`: `google-free` or `openai-compatible`
-- `API URL`: full OpenAI-compatible `chat/completions` endpoint
-- `API Key`: bearer token
-- `Model`: model id such as `gpt-4.1-mini` or a compatible provider model name
-- `Temp`: request temperature
-- `Timeout`: request timeout in milliseconds
-- `System`: system prompt used for subtitle translation
-- `Sample`: a test line for verifying the model API
+这些设置会同时影响所有字幕轨：
 
-The engine panel also includes a `Test API` button that sends one sample request with the current source and target language settings, then reports the result in the status bar.
+- 基础字号
+- 底部偏移
+- 最大宽度
+- 轨间距
+- 对齐方式
+- 换行模式
+- 原文大小写修正模式
 
-### OpenAI-compatible example
+这个区块支持单独展开 / 收起，并会记住上一次的开合状态。
 
-- Mode: `openai-compatible`
-- API URL: `https://api.openai.com/v1/chat/completions`
-- API Key: `YOUR_KEY`
-- Model: `gpt-4.1-mini`
-- Temp: `0`
-- Timeout: `30000`
-- System:
+### 3. 字幕管理
 
-```text
-You are a subtitle translator. Translate the subtitle text faithfully into the target language. Return only the translated subtitle text.
-```
+固定包含四张卡片，顺序始终为：
 
-When OpenAI mode is active, the script sends one request per subtitle line using the standard Chat Completions payload and reads the translated text from `choices[0].message.content`.
+1. `源字幕`
+2. `Google 翻译`
+3. `模型 1`
+4. `模型 2`
 
-## Style panel
+每张卡片都支持：
 
-The built-in GUI can adjust and persist:
+- `开启 / 关闭`
+- 展开查看详细配置
+- 单独调整字号倍率、字重、文字颜色、底色、底色透明度
 
-- global subtitle base size, bottom offset, width, line gap, and text alignment
-- subtitle line break mode: `Smart` merges forced line wraps inside one cue, `Raw` keeps the source formatting
-- original subtitle case mode: `Smart` for all-caps cleanup or `Raw` to keep source text
-- primary subtitle font size, font weight, text color, background color, and background opacity
-- secondary subtitle font size, font weight, text color, background color, and background opacity
+额外说明：
 
-## Known limitations
+- `源字幕`：直接显示原始字幕文本，不发起翻译请求
+- `Google 翻译`：使用内置 Google Translate 网页接口，固定翻译到简体中文
+- `模型 1 / 模型 2`：各自使用独立的 OpenAI-compatible 配置，可同时翻译同一份源字幕
 
-- This MVP assumes Tubi loads plain `.srt` or `.vtt` subtitle files.
-- If Tubi renders subtitles through a custom DOM layer, you may still need to turn off native captions manually to avoid duplicate subtitles.
-- The default translation backend is the public Google Translate web endpoint. It is useful for prototyping, but not a hard-reliability backend.
-- The OpenAI-compatible mode currently translates subtitle lines one by one for predictable cue mapping, so it can be slower and more expensive than Google mode.
-- Some subtitle files contain ads, music cues, or sound descriptions such as `[ BELL RINGING ]`; those will be translated as normal lines.
-- The `Smart` case cleanup only affects on-screen display of fully uppercase original subtitles.
+## 模型轨配置
 
-## Next improvements
+`模型 1` 和 `模型 2` 各自拥有独立配置：
 
-- add subtitle offset controls
-- add per-video cache keyed by subtitle URL
-- support custom site selectors if Tubi changes player structure
+- `接口 URL`
+- `API Key`
+- `模型名`
+- `温度`
+- `超时`
+- `系统提示词`
+- `测试文本`
+- `测试接口`
+
+脚本会把两条模型轨完全隔离：
+
+- 请求不会混用
+- 缓存不会混用
+- 修改某一条模型轨的配置，只会让该轨重新翻译，不影响另一条轨
+
+## 默认状态
+
+- 默认启用：`源字幕`、`Google 翻译`
+- 默认关闭：`模型 1`、`模型 2`
+- 当模型轨未配置完成时，卡片会显示 `未配置`
+- 只有已启用的译文轨才会发起翻译请求
+
+## 已知限制
+
+- 当前仅支持 Tubi 加载的明文 `.srt` / `.vtt` 字幕文件
+- 如果 Tubi 后续改成自定义字幕协议或更换播放器结构，自动检测逻辑可能需要调整
+- Google 轨使用公开网页接口，适合快速验证，不保证长期稳定性
+- 某些 OpenAI-compatible 服务可能不会严格返回 JSON 数组；脚本会退回逐条请求，但速度会更慢
+- 一些字幕里的音效提示、广告文案、旁白说明也会被当作普通字幕翻译
+
+## 代码说明
+
+- 脚本仍然是单文件 userscript，没有引入构建流程
+- 本次重构使用新的设置键和缓存键：
+  - `tb_settings_v2`
+  - `tb_translation_cache_v2`
+- 旧版扁平设置会在首次加载时自动迁移到新的多轨结构
+- 旧版导出字幕、手动字幕 URL、目标语言设置和 Tampermonkey 菜单项已移除
