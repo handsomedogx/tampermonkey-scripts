@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT对话目录（问题导航）
 // @namespace    https://example.com/
-// @version      0.2.2
+// @version      0.3.1
 // @description  Sidebar TOC of user questions in a ChatGPT conversation, jump to question.
 // @match        https://chatgpt.com/*
 // @grant        GM_addStyle
@@ -75,10 +75,6 @@
       border: 1px solid transparent;
     }
     .cgtoc-item:hover { background: rgba(255,255,255,0.08); }
-    .cgtoc-item.active {
-      background: rgba(59,130,246,0.25);
-      border-color: rgba(59,130,246,0.35);
-    }
     .cgtoc-text {
       flex: 1;
       line-height: 1.25;
@@ -190,19 +186,58 @@
 
   function findTurns() {
     const root = getConversationRoot();
-    const articles = Array.from(root.querySelectorAll('article[data-testid^="conversation-turn-"]'));
-    return articles;
+    const candidates = [
+      ...root.querySelectorAll('[data-message-id][data-message-author-role]'),
+      ...root.querySelectorAll('article[data-testid^="conversation-turn-"]'),
+      ...root.querySelectorAll('div[data-testid^="conversation-turn-"]'),
+      ...root.querySelectorAll('article'),
+    ];
+    const unique = Array.from(new Set(candidates));
+    return unique.filter((node) => {
+      if (!hasMessageMarker(node)) return false;
+      if (node.matches?.('[data-message-id][data-message-author-role]')) return true;
+      return !unique.some((other) =>
+        other !== node &&
+        node.contains(other) &&
+        other.matches?.('[data-message-id][data-message-author-role]')
+      );
+    });
   }
 
   function isUserTurn(article) {
     const t = article.getAttribute('data-turn');
-    return t === 'user';
+    if (t === 'user') return true;
+
+    const selfRole = article.getAttribute('data-message-author-role');
+    if (selfRole === 'user') return true;
+
+    const nestedUser = article.querySelector('[data-message-author-role="user"]');
+    if (nestedUser) return true;
+
+    return !!(
+      article.matches?.('.user-message-bubble-color, [class*="user-message-bubble-color"]') ||
+      article.querySelector('.user-message-bubble-color, [class*="user-message-bubble-color"]')
+    );
   }
 
   function extractUserQuestionText(userArticle) {
-    const tNode = userArticle.querySelector('[data-message-author-role="user"] .whitespace-pre-wrap');
-    const t = (tNode?.innerText || '').trim().replace(/\s+/g, ' ');
-    return t;
+    const roleRoot = userArticle.querySelector('[data-message-author-role="user"]') || userArticle;
+    const candidates = [
+      '.whitespace-pre-wrap',
+      '[class*="whitespace-pre-wrap"]',
+      '.markdown',
+      '[class*="markdown"]',
+      '.prose',
+      '[class*="prose"]',
+    ];
+
+    for (const selector of candidates) {
+      const node = roleRoot.querySelector(selector);
+      const text = normalizeText(node?.innerText || node?.textContent || '');
+      if (text) return text;
+    }
+
+    return normalizeText(roleRoot.innerText || roleRoot.textContent || '');
   }
 
   function ensureAnchor(el, prefix, idx) {
@@ -212,13 +247,23 @@
     return el.id;
   }
 
+  function hasMessageMarker(node) {
+    return !!(
+      node.matches?.('[data-message-author-role], [data-message-id]') ||
+      node.querySelector('[data-message-author-role], [data-message-id]')
+    );
+  }
+
     function buildTOC() {
         createPanel();
         const list = document.getElementById('cgtoc-list');
         if (!list) return;
 
         const turns = findTurns();
-        if (!turns.length) return;
+        if (!turns.length) {
+            list.innerHTML = '<div class="cgtoc-item">未找到对话内容</div>';
+            return;
+        }
 
         const items = [];
         let qIndex = 0;
@@ -237,13 +282,15 @@
                 title: qText.length > 70 ? qText.slice(0, 70) + '…' : qText,
                 full: qText,
                 qAnchor,
-                qEl: art,
             });
 
             qIndex++;
         }
 
         list.innerHTML = '';
+        if (!items.length) {
+            list.innerHTML = '<div class="cgtoc-item">未找到用户提问，可能是页面结构变了</div>';
+        }
         for (const it of items) {
             const row = document.createElement('div');
             row.className = 'cgtoc-item';
@@ -258,8 +305,10 @@
 
             list.appendChild(row);
         }
+    }
 
-        setupScrollSpy();
+    function normalizeText(text) {
+        return String(text || '').trim().replace(/\s+/g, ' ');
     }
 
     // 处理 HTML 转义的辅助函数
@@ -276,32 +325,6 @@
     const el = document.getElementById(anchorId);
     if (!el) return;
     el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
-  function setupScrollSpy() {
-    const list = document.getElementById('cgtoc-list');
-    if (!list) return;
-
-    const handler = throttle(() => {
-      let best = -1;
-      let bestDist = Infinity;
-
-      for (let i = 0; i < lastItems.length; i++) {
-        const n = lastItems[i].qEl;
-        if (!n?.getBoundingClientRect) continue;
-        const r = n.getBoundingClientRect();
-        const dist = Math.abs(r.top - 120);
-        if (r.bottom > 80 && r.top < window.innerHeight && dist < bestDist) {
-          bestDist = dist;
-          best = i;
-        }
-      }
-
-      const rows = Array.from(list.querySelectorAll('.cgtoc-item'));
-      rows.forEach((row, idx) => row.classList.toggle('active', idx === best));
-    }, 120);
-
-    window.addEventListener('scroll', handler, { passive: true });
   }
 
   function throttle(fn, wait) {

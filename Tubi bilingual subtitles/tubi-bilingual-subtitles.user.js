@@ -25,6 +25,7 @@
   const TRANSLATION_TRACK_IDS = ["google", "model1", "model2"];
   const MAX_CACHE_ENTRIES = 5000;
   const TICK_MS = 120;
+  const PLAYER_SEEK_STEP_SECONDS = 5;
   const TRANSLATION_LOOKAHEAD_SECONDS = 75;
   const TRANSLATION_LOOKAHEAD_CUES = 28;
   const TRANSLATION_BACKTRACK_CUES = 2;
@@ -103,6 +104,7 @@
     patchFetch();
     patchXHR();
     bindKeyboardEventGuard();
+    bindPlaybackSeekHotkeys();
     injectStyles();
     observePage();
 
@@ -1328,6 +1330,79 @@
         }, true);
       });
     });
+  }
+
+  function bindPlaybackSeekHotkeys() {
+    const hotkeyTargets = [window, document];
+    hotkeyTargets.forEach((target) => {
+      target.addEventListener("keydown", (event) => {
+        const seekDelta = getPlaybackSeekHotkeyDelta(event);
+        if (!seekDelta || shouldIgnorePlaybackSeekHotkey(event)) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        }
+
+        seekActiveVideoBy(seekDelta);
+      }, true);
+    });
+  }
+
+  function getPlaybackSeekHotkeyDelta(event) {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+      return 0;
+    }
+
+    if (event.key === "ArrowLeft") {
+      return -PLAYER_SEEK_STEP_SECONDS;
+    }
+
+    if (event.key === "ArrowRight") {
+      return PLAYER_SEEK_STEP_SECONDS;
+    }
+
+    return 0;
+  }
+
+  function shouldIgnorePlaybackSeekHotkey(event) {
+    if (!state.video || !state.video.isConnected) {
+      return true;
+    }
+
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return false;
+    }
+
+    if (target.isContentEditable) {
+      return true;
+    }
+
+    return Boolean(target.closest("input, textarea, select, [contenteditable=''], [contenteditable='true'], [role='textbox']"));
+  }
+
+  function seekActiveVideoBy(deltaSeconds) {
+    if (!state.video) {
+      return;
+    }
+
+    const currentTime = Number.isFinite(state.video.currentTime) ? state.video.currentTime : 0;
+    const maxTime = Number.isFinite(state.video.duration) && state.video.duration > 0
+      ? state.video.duration
+      : Number.POSITIVE_INFINITY;
+    const nextTime = clamp(currentTime + deltaSeconds, 0, maxTime);
+    if (Math.abs(nextTime - currentTime) < 0.01) {
+      return;
+    }
+
+    state.video.currentTime = nextTime;
+    state.cueKey = "";
+    renderActiveCue();
+    pumpProgressiveTranslation();
   }
 
   function isOverlayKeyboardTarget(target) {
