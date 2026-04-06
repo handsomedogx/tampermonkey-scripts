@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Unfamiliar Word Count
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  记录不认识单词 + 单词本 + 次数统计
 // @match        https://web.shanbay.com/*
 // @run-at       document-start
@@ -379,7 +379,7 @@
         style.textContent = `
             #${PANEL_ID} {
                 position: fixed;
-                z-index: 999999;
+                z-index: 998;
                 width: 320px;
                 max-height: min(520px, calc(100vh - 32px));
                 display: flex;
@@ -564,11 +564,42 @@
             }
 
             #${PANEL_ID} .tm-uwc__list {
+                position: relative;
                 overflow-y: auto;
-                padding: 10px 14px 14px;
+                padding: 10px 10px 14px 14px;
                 display: flex;
                 flex-direction: column;
                 gap: 8px;
+                scrollbar-gutter: stable;
+                scrollbar-width: thin;
+                scrollbar-color: rgba(135, 172, 255, 0.78) rgba(255, 255, 255, 0.06);
+            }
+
+            #${PANEL_ID} .tm-uwc__list::-webkit-scrollbar {
+                width: 10px;
+            }
+
+            #${PANEL_ID} .tm-uwc__list::-webkit-scrollbar-track {
+                margin: 10px 0 14px;
+                border-radius: 999px;
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.08));
+            }
+
+            #${PANEL_ID} .tm-uwc__list::-webkit-scrollbar-thumb {
+                border: 2px solid transparent;
+                border-radius: 999px;
+                background: linear-gradient(180deg, rgba(151, 184, 255, 0.92), rgba(103, 135, 217, 0.92));
+                background-clip: padding-box;
+                box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+            }
+
+            #${PANEL_ID} .tm-uwc__list:hover::-webkit-scrollbar-thumb {
+                background: linear-gradient(180deg, rgba(174, 201, 255, 0.96), rgba(115, 148, 228, 0.96));
+                background-clip: padding-box;
+            }
+
+            #${PANEL_ID} .tm-uwc__list::-webkit-scrollbar-corner {
+                background: transparent;
             }
 
             #${PANEL_ID} .tm-uwc__empty {
@@ -1027,4 +1058,3 @@
 
     mountWhenReady();
 })();
-
