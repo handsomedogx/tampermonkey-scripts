@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tubi 多轨字幕助手
 // @namespace    https://github.com/handsomedog/tubi-translate
-// @version      0.4.1
+// @version      0.4.2
 // @description  自动捕获 Tubi 字幕，并以多轨方式叠加显示原文、Google 翻译和模型翻译。
 // @match        https://tubitv.com/*
 // @match        https://*.tubitv.com/*
@@ -33,6 +33,8 @@
   const TRANSLATION_URGENT_LEAD_SECONDS = 18;
   const TRANSLATION_BATCH_COOLDOWN_MS = 900;
   const TRANSLATION_FAILURE_BACKOFF_MS = 5000;
+  const TEXT_SCALE_MIN = 0.1;
+  const TEXT_SCALE_MAX = 1.8;
 
   const TRACK_META = {
     source: {
@@ -374,8 +376,8 @@
       getValue: () => state.settings.layout.fontScale,
       onInput: (value) => applyLayoutSetting("fontScale", value, true),
       onChange: (value) => applyLayoutSetting("fontScale", value, false),
-      min: 0.7,
-      max: 1.8,
+      min: TEXT_SCALE_MIN,
+      max: TEXT_SCALE_MAX,
       step: 0.05,
       format: (value) => `${formatNumber(value, 2)}x`
     }));
@@ -531,8 +533,8 @@
       getValue: () => state.settings.tracks[trackId].style.scale,
       onInput: (value) => applyTrackStyleSetting(trackId, "scale", value, true),
       onChange: (value) => applyTrackStyleSetting(trackId, "scale", value, false),
-      min: 0.7,
-      max: 1.8,
+      min: TEXT_SCALE_MIN,
+      max: TEXT_SCALE_MAX,
       step: 0.05,
       format: (value) => `${formatNumber(value, 2)}x`
     }));
@@ -1432,7 +1434,7 @@
     state.overlayRoot.style.width = `${videoRect.width}px`;
     state.overlayRoot.style.height = `${videoRect.height}px`;
 
-    const fontSize = Math.max(18, Math.round(videoRect.width * 0.028 * state.settings.layout.fontScale));
+    const fontSize = Math.max(2, Math.round(videoRect.width * 0.028 * state.settings.layout.fontScale));
     state.subtitleBox.style.paddingBottom = `${state.settings.layout.bottomOffsetPx}px`;
 
     TRACK_ORDER.forEach((trackId) => {
@@ -2778,7 +2780,7 @@
     const legacyEngine = parseLegacyEngine(raw.engine);
     const translationEnabled = raw.showTranslation !== false;
     const translationStyle = {
-      scale: clamp(raw.translationScale ?? defaults.tracks.google.style.scale, 0.7, 1.8),
+      scale: clamp(raw.translationScale ?? defaults.tracks.google.style.scale, TEXT_SCALE_MIN, TEXT_SCALE_MAX),
       color: normalizeHexColor(raw.translationColor ?? defaults.tracks.google.style.color, defaults.tracks.google.style.color),
       bgColor: normalizeHexColor(raw.translationBgColor ?? defaults.tracks.google.style.bgColor, defaults.tracks.google.style.bgColor),
       bgOpacity: clamp(raw.translationBgOpacity ?? defaults.tracks.google.style.bgOpacity, 0, 1),
@@ -2970,7 +2972,7 @@
   function normalizeLayout(raw, defaults) {
     const source = raw && typeof raw === "object" ? raw : {};
     return {
-      fontScale: clamp(source.fontScale ?? defaults.fontScale, 0.7, 1.8),
+      fontScale: clamp(source.fontScale ?? defaults.fontScale, TEXT_SCALE_MIN, TEXT_SCALE_MAX),
       bottomOffsetPx: clamp(source.bottomOffsetPx ?? defaults.bottomOffsetPx, 0, 180),
       maxWidthPercent: clamp(source.maxWidthPercent ?? defaults.maxWidthPercent, 60, 100),
       lineGapEm: clamp(source.lineGapEm ?? defaults.lineGapEm, 0, 1.2),
@@ -3003,7 +3005,7 @@
   function normalizeTrackStyle(raw, defaults) {
     const source = raw && typeof raw === "object" ? raw : {};
     return {
-      scale: clamp(source.scale ?? defaults.scale, 0.7, 1.8),
+      scale: clamp(source.scale ?? defaults.scale, TEXT_SCALE_MIN, TEXT_SCALE_MAX),
       color: normalizeHexColor(source.color ?? defaults.color, defaults.color),
       bgColor: normalizeHexColor(source.bgColor ?? defaults.bgColor, defaults.bgColor),
       bgOpacity: clamp(source.bgOpacity ?? defaults.bgOpacity, 0, 1),
@@ -3013,7 +3015,7 @@
 
   function normalizeLayoutValue(key, value) {
     if (key === "fontScale") {
-      return clamp(value, 0.7, 1.8);
+      return clamp(value, TEXT_SCALE_MIN, TEXT_SCALE_MAX);
     }
 
     if (key === "bottomOffsetPx") {
@@ -3045,7 +3047,7 @@
 
   function normalizeTrackStyleValue(key, value) {
     if (key === "scale") {
-      return clamp(value, 0.7, 1.8);
+      return clamp(value, TEXT_SCALE_MIN, TEXT_SCALE_MAX);
     }
 
     if (key === "fontWeight") {
